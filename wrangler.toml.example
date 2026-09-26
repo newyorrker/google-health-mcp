@@ -23,6 +23,10 @@ HEALTH_PROVIDER = "google"
 # land on the wrong day. Defaults to UTC when unset.
 TIMEZONE = "Europe/London"
 
+# "true" exposes the write, delete and meal-preset tools. Keep "false" unless
+# you also ran `pnpm run setup:google -- --write` to grant write scopes.
+ENABLE_WRITE_TOOLS = "false"
+
 # Create both KV namespaces before `wrangler deploy`:
 #   wrangler kv namespace create TOKENS
 #   wrangler kv namespace create CACHE

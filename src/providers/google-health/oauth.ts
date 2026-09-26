@@ -121,9 +121,9 @@ export async function refreshTokens(env: Env, refreshToken: string): Promise<Tok
     parsed = RefreshResponse.parse(JSON.parse(text));
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    throw new GoogleAuthError(
-      `Google token refresh returned an unexpected payload (${reason}): ${text}`,
-    );
+    // Do not include the body: it may hold a fresh access_token, and this
+    // message can reach the Claude chat through the tool error result.
+    throw new GoogleAuthError(`Google token refresh returned an unexpected payload (${reason})`);
   }
 
   const issuedAtSec = Math.floor(Date.now() / 1000);

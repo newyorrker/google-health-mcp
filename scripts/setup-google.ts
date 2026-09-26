@@ -4,20 +4,28 @@
  *
  *   export GOOGLE_CLIENT_ID=...
  *   export GOOGLE_CLIENT_SECRET=...
- *   pnpm run setup:google
+ *   pnpm run setup:google            # read-only scopes
+ *   pnpm run setup:google -- --write # also request write scopes
  *
  * Starts a localhost callback server, walks the Authorization Code + PKCE flow
- * in the system browser, exchanges the code for tokens, and prints the exact
- * `wrangler` commands that move them into Workers KV / Secrets.
+ * in the system browser, exchanges the code for tokens, and writes them
+ * straight into the TOKENS Workers KV namespace with `wrangler`. The tokens
+ * are never printed, so they do not end up in shell history or scrollback.
+ *
+ * Needs a configured wrangler.toml (TOKENS namespace id) and `wrangler login`.
  *
  * The Worker never runs this path. Google blocks OAuth inside embedded
  * WebViews (`disallowed_useragent`), which is exactly what Claude mobile would
  * use, so consent is collected once here in a real browser instead.
  */
 
-import { exec } from 'node:child_process';
+import { exec, execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { envPath, loadEnv } from './load-env';
 
@@ -30,24 +38,36 @@ const CALLBACK_PORT = 8788;
 const CALLBACK_PATH = '/google/callback';
 
 /**
- * Read + write across every category this server touches.
+ * Read scopes for every category this server touches. This is the default:
+ * without write scopes Google itself rejects every write and delete, even if
+ * the connector URL leaks.
  *
  * Google splits read and write into separate scopes; a `.writeonly` scope does
  * NOT imply read. `settings.readonly` is what backs `list_devices` and the
  * unit/timezone fields of `get_profile`.
  */
-const SCOPES = [
+const READ_SCOPES = [
   'https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly',
-  'https://www.googleapis.com/auth/googlehealth.activity_and_fitness.writeonly',
   'https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly',
-  'https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.writeonly',
   'https://www.googleapis.com/auth/googlehealth.sleep.readonly',
-  'https://www.googleapis.com/auth/googlehealth.sleep.writeonly',
   'https://www.googleapis.com/auth/googlehealth.nutrition.readonly',
-  'https://www.googleapis.com/auth/googlehealth.nutrition.writeonly',
   'https://www.googleapis.com/auth/googlehealth.profile.readonly',
   'https://www.googleapis.com/auth/googlehealth.settings.readonly',
 ];
+
+/** Added only with `--write`. Pair with ENABLE_WRITE_TOOLS = "true" in wrangler.toml. */
+const WRITE_SCOPES = [
+  'https://www.googleapis.com/auth/googlehealth.activity_and_fitness.writeonly',
+  'https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.writeonly',
+  'https://www.googleapis.com/auth/googlehealth.sleep.writeonly',
+  'https://www.googleapis.com/auth/googlehealth.nutrition.writeonly',
+];
+
+const WITH_WRITE = process.argv.includes('--write');
+const SCOPES = WITH_WRITE ? [...READ_SCOPES, ...WRITE_SCOPES] : READ_SCOPES;
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const WRANGLER_TOML = path.join(REPO_ROOT, 'wrangler.toml');
 
 const TokenResponse = z.object({
   access_token: z.string(),
@@ -178,6 +198,60 @@ async function exchangeCode(opts: {
   return TokenResponse.parse(json);
 }
 
+/** Runs wrangler without a shell and with its output captured, not shown. */
+function wrangler(args: string[]): void {
+  execFileSync('pnpm', ['wrangler', ...args], {
+    cwd: REPO_ROOT,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+/**
+ * Writes one key into the remote TOKENS namespace. The value goes through a
+ * 0600 temp file (`--path`), so it is not visible in the process list and
+ * wrangler does not echo it.
+ */
+function putTokenKv(key: string, value: string): void {
+  const dir = mkdtempSync(path.join(tmpdir(), 'setup-google-'));
+  const file = path.join(dir, 'value');
+  try {
+    writeFileSync(file, value, { mode: 0o600 });
+    wrangler(['kv', 'key', 'put', '--remote', '--binding=TOKENS', key, '--path', file]);
+  } catch (err) {
+    const raw = err instanceof Error ? err.message : String(err);
+    throw new Error(`wrangler kv key put ${key} failed:\n${raw.replaceAll(value, mask(value))}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Fails before the OAuth flow, so a broken setup does not waste a consent.
+ * Listing the TOKENS namespace checks the login, the namespace id in
+ * wrangler.toml and the account selection in one call.
+ */
+function assertWranglerReady(): void {
+  if (!existsSync(WRANGLER_TOML)) {
+    console.error('Error: wrangler.toml not found.');
+    console.error('  cp wrangler.toml.example wrangler.toml');
+    console.error('  pnpm wrangler kv namespace create TOKENS   # paste the id into wrangler.toml');
+    console.error('  pnpm wrangler kv namespace create CACHE    # paste the id into wrangler.toml');
+    process.exit(1);
+  }
+  try {
+    wrangler(['kv', 'key', 'list', '--remote', '--binding=TOKENS']);
+  } catch (err) {
+    console.error('Error: cannot reach the TOKENS KV namespace with wrangler.');
+    console.error('  Check `pnpm wrangler login` and the TOKENS id in wrangler.toml.');
+    console.error(
+      '  If your Cloudflare login has several accounts, set account_id in wrangler.toml.',
+    );
+    console.error('');
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+}
+
 function printSetupHelp(): void {
   console.error('Error: GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are not set.');
   console.error('');
@@ -211,6 +285,7 @@ async function main(): Promise<void> {
     printSetupHelp();
     process.exit(1);
   }
+  assertWranglerReady();
 
   const state = base64url(randomBytes(16));
   const { verifier, challenge } = generatePkce();
@@ -271,37 +346,23 @@ async function main(): Promise<void> {
     }
   }
   console.log('');
-  console.log('Next: push these to Cloudflare Workers.');
-  console.log('──────────────────────────────────────');
+  console.log('Writing tokens to the TOKENS KV namespace…');
+  putTokenKv('google_refresh_token', tokens.refresh_token);
+  putTokenKv('google_access_token', tokens.access_token);
+  putTokenKv('google_expires_at', String(expiresAt));
+  console.log('✓ Tokens stored in Workers KV (not printed).');
   console.log('');
-  console.log('1) One-time KV namespaces (skip if they already exist):');
-  console.log('   pnpm wrangler kv namespace create TOKENS');
-  console.log('   pnpm wrangler kv namespace create CACHE');
-  console.log('   # paste the returned ids into wrangler.toml');
-  console.log('');
-  console.log('2) Secrets:');
-  console.log('   pnpm wrangler secret put GOOGLE_CLIENT_ID');
-  console.log(`     ↳ value: ${clientId}`);
-  console.log('   pnpm wrangler secret put GOOGLE_CLIENT_SECRET');
-  console.log('     ↳ value: <your OAuth client secret>');
-  console.log('   pnpm wrangler secret put MCP_SHARED_SECRET');
-  console.log('     ↳ value: openssl rand -hex 32');
-  console.log('');
-  console.log('3) Tokens into the TOKENS KV namespace (--remote is required):');
+  console.log('Next:');
+  console.log('  1) Verify the token reads your data (the token is not echoed):');
   console.log(
-    `   pnpm wrangler kv key put --remote --binding=TOKENS google_refresh_token '${tokens.refresh_token}'`,
+    '     GOOGLE_ACCESS_TOKEN=$(pnpm -s wrangler kv key get --remote --binding=TOKENS google_access_token) pnpm run probe:google',
   );
-  console.log(
-    `   pnpm wrangler kv key put --remote --binding=TOKENS google_access_token '${tokens.access_token}'`,
-  );
-  console.log(
-    `   pnpm wrangler kv key put --remote --binding=TOKENS google_expires_at '${expiresAt}'`,
-  );
-  console.log('');
-  console.log('4) Verify the token actually reads your data:');
-  console.log(`   GOOGLE_ACCESS_TOKEN='${tokens.access_token}' pnpm run probe:google`);
-  console.log('');
-  console.log('5) Deploy: pnpm deploy');
+  console.log('  2) Deploy: pnpm deploy');
+  if (WITH_WRITE) {
+    console.log('');
+    console.log('  Write scopes granted. Set ENABLE_WRITE_TOOLS = "true" in wrangler.toml');
+    console.log('  to expose the write/delete tools, then deploy.');
+  }
   console.log('');
 }
 

@@ -1,0 +1,6 @@
+# Install scripts that pnpm may run. esbuild bundles the Worker and workerd is
+# the local Workers runtime; sharp (image processing via wrangler) is unused.
+allowBuilds:
+  esbuild: true
+  workerd: true
+  sharp: false

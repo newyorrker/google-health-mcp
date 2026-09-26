@@ -26,6 +26,10 @@ export function registerAllTools(server: McpServer, provider: HealthProvider, en
   registerNutritionReadTools(server, provider, env);
   registerMetricsReadTools(server, provider, env);
 
+  // Write, delete and preset tools are off by default. They also need the
+  // write scopes from `pnpm run setup:google -- --write`.
+  if (env.ENABLE_WRITE_TOOLS !== 'true') return;
+
   // ---- Write / delete ----
   registerFoodWriteTools(server, provider, env);
   registerBodyWriteTools(server, provider, env);

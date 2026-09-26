@@ -26,6 +26,8 @@ specific data type.
 ## What it does
 
 - **Read** (16 tools) — activity and steps, heart rate (daily + intraday), sleep with stages, weight and body fat, food and water logs, SpO2, respiratory rate, skin temperature, HRV, VO2 max, paired devices.
+Write, delete and meal-preset tools are **off by default** (see [Read-only by default](#read-only-by-default)).
+
 - **Write** (7 tools) — food, water, weight, body fat, activity and sleep logs.
 - **Delete** (6 tools) — remove individual entries.
 - **Meal presets** (4 tools) — reusable nutrition profiles stored in Workers KV.
@@ -39,7 +41,8 @@ specific data type.
 - A **Google Cloud project** with the Google Health API enabled — free.
 - A **Cloudflare account** — the free plan is enough.
 - A **Claude account** — custom connectors must be added from claude.ai on the web, then sync to mobile.
-- **Node.js 20+** and **pnpm 9+** locally.
+- **Node.js 20+** and **pnpm 11+** locally (`pnpm-workspace.yaml` uses `allowBuilds`).
+- **macOS or Linux** for `setup:google` (it calls `pnpm` without a shell, which does not work on Windows).
 
 You do **not** need a Fitbit developer account. If you already made one, it is only useful for the legacy `HEALTH_PROVIDER=fitbit` path, which stops working this month.
 
@@ -63,12 +66,36 @@ pnpm install
    - User type: **External**
    - Add your own Google account under **Test users**
    - **Publish the app so its status is "In production".** This matters: while the app sits in *Testing*, Google expires refresh tokens after **7 days**, and the Worker will break every week. Publishing does *not* require Google's security review — that is only needed above 100 users.
-4. **Add the scopes** — https://console.cloud.google.com/auth/scopes — search "Google Health API" and add read and write for activity & fitness, health metrics & measurements, sleep and nutrition, plus profile and settings (read).
+4. **Add the scopes** — https://console.cloud.google.com/auth/scopes — search "Google Health API" and add the **read** scopes for activity & fitness, health metrics & measurements, sleep, nutrition, profile and settings. Add the write scopes too only if you plan to use write tools (see [Read-only by default](#read-only-by-default)).
 5. **Create an OAuth client ID** — https://console.cloud.google.com/apis/credentials
    - Application type: **Desktop app**
    - Copy the **Client ID** and **Client secret**
 
-### 3. Authorize
+### 3. Prepare Cloudflare
+
+```bash
+pnpm wrangler login
+
+cp wrangler.toml.example wrangler.toml
+# then check TIMEZONE in wrangler.toml — it decides what "today" means for
+# every tool with an optional date. Ships as "Europe/London".
+
+pnpm wrangler kv namespace create TOKENS
+pnpm wrangler kv namespace create CACHE
+# paste the returned ids into wrangler.toml
+
+pnpm wrangler secret put GOOGLE_CLIENT_ID
+pnpm wrangler secret put GOOGLE_CLIENT_SECRET
+```
+
+Now create the shared secret. It is part of the connector URL, so it works like a password: save it in your password manager, then paste it at the prompt.
+
+```bash
+openssl rand -hex 32
+pnpm wrangler secret put MCP_SHARED_SECRET
+```
+
+### 4. Authorize
 
 Copy the template and paste your two values into it:
 
@@ -89,7 +116,7 @@ No quotes, no trailing spaces. `.env` is gitignored. Then:
 pnpm run setup:google
 ```
 
-Your browser opens Google's consent screen. Approve it, and the script prints the exact `wrangler` commands for the next step.
+Your browser opens Google's consent screen. Approve it, and the script writes the tokens straight into the `TOKENS` KV namespace. It never prints them, so they do not end up in your shell history. Add `-- --write` to also request write scopes.
 
 <details>
 <summary>Prefer environment variables to a file?</summary>
@@ -115,27 +142,6 @@ set GOOGLE_CLIENT_SECRET=...
 
 Consent is collected here, in a real browser, on purpose: Google blocks OAuth inside embedded WebViews (`disallowed_useragent`), which is what Claude mobile would use.
 
-### 4. Push to Cloudflare
-
-```bash
-cp wrangler.toml.example wrangler.toml
-# then check TIMEZONE in wrangler.toml — it decides what "today" means for
-# every tool with an optional date. Ships as "Europe/London".
-
-pnpm wrangler kv namespace create TOKENS
-pnpm wrangler kv namespace create CACHE
-# paste the returned ids into wrangler.toml
-
-pnpm wrangler secret put GOOGLE_CLIENT_ID
-pnpm wrangler secret put GOOGLE_CLIENT_SECRET
-openssl rand -hex 32 | pnpm wrangler secret put MCP_SHARED_SECRET
-
-# tokens — copy the exact commands printed by setup:google (--remote matters)
-pnpm wrangler kv key put --remote --binding=TOKENS google_refresh_token '<paste>'
-pnpm wrangler kv key put --remote --binding=TOKENS google_access_token  '<paste>'
-pnpm wrangler kv key put --remote --binding=TOKENS google_expires_at    '<paste>'
-```
-
 ### 5. Deploy
 
 ```bash
@@ -151,6 +157,18 @@ pnpm deploy
 4. Save; it syncs to Claude Desktop and mobile automatically
 
 New connectors cannot be added from Claude mobile — use the web.
+
+### Read-only by default
+
+The server exposes only read tools, and `setup:google` asks Google only for read scopes. With no write scopes, Google itself rejects every write and delete, even if the connector URL leaks. To enable writes:
+
+1. Run `pnpm run setup:google -- --write` and approve the extra scopes.
+2. Set `ENABLE_WRITE_TOOLS = "true"` in `wrangler.toml`.
+3. `pnpm deploy`.
+
+### Keep the URL secret
+
+The Anthropic CIDR allowlist lets through every Claude user, not only you. So the secret in the URL is the only thing that keeps others out. Do not paste the URL into chats or screenshots. `wrangler tail` and Cloudflare request logs also show the full path. If the URL leaks, rotate the secret with `wrangler secret put MCP_SHARED_SECRET` and update the connector.
 
 ---
 
@@ -169,20 +187,13 @@ The deployed Worker **never reads `.env`** — Cloudflare doesn't upload it. If 
 `GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are not set` error.
 
 Your Google **refresh token** is not in any of these. It lives in the Workers KV `TOKENS`
-namespace, put there by the `wrangler kv key put` commands in step 4.
+namespace, put there by `setup:google` in step 4.
 
 ## Verifying
 
 ```bash
-# easiest: paste the access token setup:google printed into .env as
-#   GOOGLE_ACCESS_TOKEN=ya29...
-pnpm run probe:google
-
-# or pass it inline (bash / Git Bash)
-GOOGLE_ACCESS_TOKEN=ya29... pnpm run probe:google
-
-# or against the token the deployed Worker is using
-GOOGLE_ACCESS_TOKEN=$(pnpm wrangler kv key get --remote --binding=TOKENS google_access_token) \
+# against the token the deployed Worker is using (the token is not echoed)
+GOOGLE_ACCESS_TOKEN=$(pnpm -s wrangler kv key get --remote --binding=TOKENS google_access_token) \
   pnpm run probe:google
 ```
 
@@ -192,12 +203,13 @@ To check the provider itself rather than the raw API — that every read method 
 sensible values, not `undefined` from a wrong field path:
 
 ```bash
-pnpm run verify:provider
+GOOGLE_ACCESS_TOKEN=$(pnpm -s wrangler kv key get --remote --binding=TOKENS google_access_token) \
+  pnpm run verify:provider
 ```
 
 It calls all 17 read methods against your live account and prints a preview of each
-result. Read-only; it never writes or deletes. Access tokens last about an hour, so
-refresh `GOOGLE_ACCESS_TOKEN` in `.env` if it starts returning 401.
+result. Read-only; it never writes or deletes. The stored access token lasts about an
+hour; if it returns 401, call any tool through Claude once so the Worker refreshes it.
 
 ---
 
@@ -236,7 +248,7 @@ refresh `GOOGLE_ACCESS_TOKEN` in `.env` if it starts returning 401.
 
 `save_meal_preset` · `list_meal_presets` · `log_preset` · `delete_meal_preset`
 
-33 tools total. Every optional `date` falls back to today.
+33 tools total; 16 by default, because write, delete and preset tools need `ENABLE_WRITE_TOOLS = "true"`. Every optional `date` falls back to today.
 
 ---
 
@@ -304,7 +316,7 @@ Single-user design, two layers:
 
 `MCP_SHARED_SECRET` lives in Workers Secrets, never in code. Rotating it is `wrangler secret put` plus updating the URL in claude.ai; your Google tokens are unaffected.
 
-**Threat model:** if the secret leaks *and* the attacker can reach you from inside Anthropic's CIDR, they can read your health data and write false entries. They cannot take over the Google account — the refresh token stays in the Worker.
+**Threat model:** if the secret leaks *and* the attacker can reach you from inside Anthropic's CIDR, they can read your health data (and write false entries, if you enabled write scopes). Note that every Claude user comes from that CIDR. They cannot take over the Google account — the refresh token stays in the Worker.
 
 ---
 
@@ -334,11 +346,13 @@ GitHub Pages serves the three URLs Google's OAuth consent screen requires:
 
 | Field on the consent screen | URL |
 |---|---|
-| Application home page | `https://novrax.github.io/fitbit-googlehealth-mcp/` |
-| Privacy policy link | `https://novrax.github.io/fitbit-googlehealth-mcp/privacy.html` |
-| Terms of service link | `https://novrax.github.io/fitbit-googlehealth-mcp/terms.html` |
+| Application home page | `https://newyorrker.github.io/google-health-mcp/` |
+| Privacy policy link | `https://newyorrker.github.io/google-health-mcp/privacy.html` |
+| Terms of service link | `https://newyorrker.github.io/google-health-mcp/terms.html` |
 
-Add `github.io` under **Authorized domains** on the same screen. Sources are in
+If you fork this repo, enable GitHub Pages (branch `main`, folder `/docs`) and
+use your own `<user>.github.io` URLs. Add `<user>.github.io` under
+**Authorized domains** on the same screen. Sources are in
 [`docs/`](docs/).
 
 ## Credits

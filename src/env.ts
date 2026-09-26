@@ -26,6 +26,12 @@ export type Env = {
    */
   TIMEZONE?: string;
 
+  /**
+   * "true" exposes the write, delete and meal-preset tools. Any other value,
+   * or unset, serves read tools only.
+   */
+  ENABLE_WRITE_TOOLS?: string;
+
   MCP_SHARED_SECRET: string;
   ALLOWED_CIDRS: string;
 };
