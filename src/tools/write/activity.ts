@@ -21,7 +21,7 @@ export function registerActivityWriteTool(
       description:
         'Record a workout that Fitbit did not auto-detect. Provide either `activityId` (Fitbit activity catalog) or `activityName` + `manualCalories`. Duration must be in milliseconds.',
       inputSchema: {
-        date: z.string().describe('YYYY-MM-DD. Omit for today (JST).').optional(),
+        date: z.string().describe('YYYY-MM-DD. Omit for today (server timezone).').optional(),
         startTime: z.string().regex(TIME_RE, 'Expected HH:mm:ss').describe('HH:mm:ss, local time.'),
         durationMs: z
           .number()

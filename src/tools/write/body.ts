@@ -20,7 +20,7 @@ export function registerBodyWriteTools(
       title: 'Log a weight entry (kg)',
       description: 'Record a weight reading, in kilograms.',
       inputSchema: {
-        date: z.string().describe('YYYY-MM-DD. Omit for today (JST).').optional(),
+        date: z.string().describe('YYYY-MM-DD. Omit for today (server timezone).').optional(),
         weightKg: z.number().positive().describe('Weight in kilograms, e.g. 65.2.'),
         time: z
           .string()
@@ -52,7 +52,7 @@ export function registerBodyWriteTools(
       title: 'Log a body-fat percentage entry',
       description: 'Record a body-fat percentage reading (e.g. from a smart scale).',
       inputSchema: {
-        date: z.string().describe('YYYY-MM-DD. Omit for today (JST).').optional(),
+        date: z.string().describe('YYYY-MM-DD. Omit for today (server timezone).').optional(),
         fatPercent: z.number().min(1).max(60).describe('Body fat %. e.g. 18.5.'),
         time: z
           .string()

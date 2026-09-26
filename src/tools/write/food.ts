@@ -41,7 +41,7 @@ export function registerFoodWriteTools(
         'transcribing macro numbers repeatedly.',
       ].join('\n'),
       inputSchema: {
-        date: z.string().describe('YYYY-MM-DD. Omit for today (JST).').optional(),
+        date: z.string().describe('YYYY-MM-DD. Omit for today (server timezone).').optional(),
         mealType: MealType,
         foodName: z.string().describe('Free-text food name, e.g. "おにぎり".'),
         calories: z.number().int().min(0).describe('kcal for the logged portion.'),
@@ -91,7 +91,7 @@ export function registerFoodWriteTools(
         'disagree with an item.',
       ].join('\n'),
       inputSchema: {
-        date: z.string().describe('YYYY-MM-DD. Omit for today (JST).').optional(),
+        date: z.string().describe('YYYY-MM-DD. Omit for today (server timezone).').optional(),
         mealType: MealType,
         items: z
           .array(
@@ -143,7 +143,7 @@ export function registerFoodWriteTools(
       title: 'Log water intake (ml)',
       description: 'Record water consumption in millilitres for the given date.',
       inputSchema: {
-        date: z.string().describe('YYYY-MM-DD. Omit for today (JST).').optional(),
+        date: z.string().describe('YYYY-MM-DD. Omit for today (server timezone).').optional(),
         amountMl: z.number().positive().describe('Millilitres.'),
       },
       outputSchema: WaterLogEntrySchema.shape,

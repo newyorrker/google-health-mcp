@@ -19,7 +19,7 @@ export function registerNutritionReadTools(
       description:
         'Meals and water intake for the day: foods array, nutrition summary (calories/carbs/fat/fiber/protein/sodium/sugar) and water total. The summary is computed from the logged entries. Defaults to today. Cached 1h.',
       inputSchema: {
-        date: z.string().describe('YYYY-MM-DD. Omit for today (JST).').optional(),
+        date: z.string().describe('YYYY-MM-DD. Omit for today (server timezone).').optional(),
       },
       outputSchema: FoodLogSchema.shape,
     },

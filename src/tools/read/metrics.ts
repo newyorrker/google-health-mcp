@@ -136,7 +136,7 @@ export function registerMetricsReadTools(
       description:
         'VO2 max (cardio fitness) estimate, returned as a number. VO2 max is not recalculated daily, so this returns the most recent reading within the previous 30 days. Defaults to today. Cached 1h.',
       inputSchema: {
-        date: z.string().describe('YYYY-MM-DD. Omit for today (JST).').optional(),
+        date: z.string().describe('YYYY-MM-DD. Omit for today (server timezone).').optional(),
       },
       outputSchema: CardioFitnessSchema.shape,
     },

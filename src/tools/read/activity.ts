@@ -24,7 +24,7 @@ export function registerActivityReadTools(
       description:
         'Steps, calories out, distance, floors, active-minute buckets and resting heart rate for a single day. Cached for 1 hour. NOTE: the current day is still being aggregated and its totals will keep changing until it closes — prefer a previous day for trend analysis. Individual metrics come from separate upstream rollups, so one may be absent while the rest are present.',
       inputSchema: {
-        date: z.string().describe('YYYY-MM-DD. Omit for today (JST).').optional(),
+        date: z.string().describe('YYYY-MM-DD. Omit for today (server timezone).').optional(),
       },
       outputSchema: DailySummarySchema.shape,
     },
@@ -87,7 +87,7 @@ export function registerActivityReadTools(
       inputSchema: {
         beforeDate: z
           .string()
-          .describe('YYYY-MM-DD. Returns entries before this date. Defaults to today (JST).')
+          .describe('YYYY-MM-DD. Returns entries before this date. Defaults to today (server timezone).')
           .optional(),
         limit: z
           .number()

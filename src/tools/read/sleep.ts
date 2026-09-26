@@ -19,7 +19,7 @@ export function registerSleepReadTools(
       description:
         'Sleep sessions for a date, including stage data (deep/light/rem/wake) when the device captured them. A night is attributed to the day it ENDS on. Defaults to today. Cached 1h.',
       inputSchema: {
-        date: z.string().describe('YYYY-MM-DD. Omit for today (JST).').optional(),
+        date: z.string().describe('YYYY-MM-DD. Omit for today (server timezone).').optional(),
       },
       outputSchema: { sleep: z.array(SleepLogSchema) },
     },

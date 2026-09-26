@@ -23,7 +23,7 @@ export function registerSleepWriteTool(
       inputSchema: {
         date: z
           .string()
-          .describe('YYYY-MM-DD of the morning after the sleep. Omit for today (JST).')
+          .describe('YYYY-MM-DD of the morning after the sleep. Omit for today (server timezone).')
           .optional(),
         startTime: z
           .string()

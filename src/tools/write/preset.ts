@@ -165,7 +165,7 @@ export function registerPresetTools(server: McpServer, provider: HealthProvider,
       inputSchema: {
         name: z.string().describe('Preset name saved via save_meal_preset.'),
         mealType: MealType,
-        date: z.string().describe('YYYY-MM-DD. Omit for today (JST).').optional(),
+        date: z.string().describe('YYYY-MM-DD. Omit for today (server timezone).').optional(),
         amount: z
           .number()
           .positive()
