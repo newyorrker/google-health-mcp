@@ -116,7 +116,7 @@ No quotes, no trailing spaces. `.env` is gitignored. Then:
 pnpm run setup:google
 ```
 
-Your browser opens Google's consent screen. Approve it, and the script writes the tokens straight into the `TOKENS` KV namespace. It never prints them, so they do not end up in your shell history. Add `-- --write` to also request write scopes.
+Your browser opens Google's consent screen. Approve it, and the script writes the tokens straight into the `TOKENS` KV namespace. It never prints them, so they do not end up in your shell history. Add `-- --write` to also request write scopes, or `-- --location` to allow TCX export (GPS routes).
 
 <details>
 <summary>Prefer environment variables to a file?</summary>
@@ -215,7 +215,7 @@ hour; if it returns 401, call any tool through Claude once so the Worker refresh
 
 ## Tools
 
-### Read (16)
+### Read (19)
 
 | Tool | Arguments | Notes |
 |---|---|---|
@@ -223,9 +223,12 @@ hour; if it returns 401, call any tool through Claude once so the Worker refresh
 | `list_devices` | — | Paired devices, battery, last sync |
 | `get_daily_summary` | `date?` | Steps, calories, distance, active minutes, resting HR |
 | `get_activity_timeseries` | `resource, start, end` | steps / distance / calories / floors / active-minute levels |
-| `get_exercise_list` | `beforeDate?, limit?` | Workout sessions |
+| `get_exercise_list` | `from?, to?, beforeDate?, limit?, min_duration_seconds?, include_short?` | Workout sessions with UTC and local times, active duration, GPS and lap flags. Records shorter than 60 s are hidden by default |
 | `get_heart_rate_range` | `start, end` | Daily resting heart rate |
-| `get_heart_rate_intraday` | `date, detailLevel` | Down-sampled from raw samples |
+| `get_heart_rate_intraday` | `date, detailLevel` | One local day, 00:00–24:00 in the profile timezone. `1sec` returns every raw sample (about one every 2–5 s) |
+| `get_heart_rate_range_intraday` | `start, end, resolution?` | Any window up to 24 h. `start`/`end` need an offset (`+05:00` or `Z`). Resolution `raw`, `5s`, `15s`, `1min`; buckets carry avg, min and max |
+| `get_exercise_heart_rate` | `exerciseId? \| logId + date?, resolution?, padding_minutes?, max_hr?` | Heart rate of one workout: series, summary, zones, events, laps |
+| `export_exercise_tcx` | `exerciseId? \| logId + date?, partial_data?, max_chars?` | Garmin TCX file of a workout. Needs the optional location scope, see below |
 | `get_sleep` | `date?` | Sessions with stage breakdown |
 | `get_sleep_range` | `start, end` | |
 | `get_body_log` | `start, end` | Weight and body fat |
@@ -235,6 +238,13 @@ hour; if it returns 401, call any tool through Claude once so the Worker refresh
 | `get_skin_temperature` | `start, end` | Deviation from baseline |
 | `get_hrv` | `start, end` | |
 | `get_cardio_fitness` | `date?` | VO2 max |
+
+### Notes on heart-rate tools
+
+- **Every time comes as a pair:** `time_utc` (`…Z`) and `time_local` (wall clock with its offset). The timezone comes from the Google profile settings.
+- **Zones.** `get_exercise_heart_rate` returns two sets. `zones.google` holds the zone times that Google stores with the workout. `zones.computed` uses the Bevel default: percent of maximum heart rate (restorative < 50 %, zones 1–5 from 50/60/70/80/90 %). Maximum heart rate is `max_hr` if you pass it, else 220 − age from the profile. Time in zone is weighted by the gap to the next sample; a gap counts at most 30 s.
+- **Cache.** Past days are cached for 1 hour, today and later for 5 minutes.
+- **TCX needs one more scope.** Run `pnpm run setup:google -- --location` to add `googlehealth.location.readonly`, and add that scope on the Data Access page of your OAuth consent screen. Without it, `export_exercise_tcx` returns HTTP 403 with a hint.
 
 ### Write (7)
 
@@ -290,7 +300,7 @@ Things that differ from Fitbit and cost time if you hit them cold:
 - **`windowSizeDays` is documented as optional but is required** — omitting it returns HTTP 400.
 - **Rollup ranges are capped**: 14 days for heart rate, total calories, active minutes and calories-in-HR-zone; 90 days for everything else.
 - **List pages cap at 25 rows** for sleep and exercise, 10000 elsewhere.
-- **No intraday detail levels.** Google exposes raw ~5-second samples; `get_heart_rate_intraday` down-samples client-side.
+- **No intraday detail levels.** Google exposes raw samples (about one every 2–5 s); the heart-rate tools bucket them client-side.
 - **Skin temperature is absolute °C** plus a baseline; Fitbit reported only the deviation, so this server derives it.
 - **Nutrient enum is `SUGAR`, singular.** Fat and carbohydrate are top-level `totalFat` / `totalCarbohydrate` fields, not `nutrients[]` entries.
 - **Delete takes a resource name, not an id.** The numeric `logId` in these tools is a stable hash of that name, resolved by scanning the last 35 days.

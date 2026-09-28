@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { Env } from '../../env';
 import { cacheKey, getCached } from '../../lib/cache';
-import { assertIsoDate, today } from '../../lib/date';
+import { assertIsoDate, cacheTtlForDate, today } from '../../lib/date';
 import { toolErrorResult } from '../../lib/errors';
 import type { HealthProvider } from '../../providers/types';
 import { FoodLogSchema } from '../../providers/types';
@@ -27,8 +27,11 @@ export function registerNutritionReadTools(
       try {
         const d = date ?? today();
         assertIsoDate(d, 'date');
-        const food = await getCached(env, cacheKey('get_food_log', { date: d }), () =>
-          provider.getFoodLog(d),
+        const food = await getCached(
+          env,
+          cacheKey('get_food_log', { date: d }),
+          () => provider.getFoodLog(d),
+          { ttlSec: cacheTtlForDate(d) },
         );
         return {
           structuredContent: food,

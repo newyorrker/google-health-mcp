@@ -113,18 +113,41 @@ export type TimeSeries = z.infer<typeof TimeSeriesSchema>;
 // ---------- Exercise log list ----------
 export const ExerciseLogSchema = z.object({
   logId: z.number().optional(),
+  /** Google data point id. Pass it to the exercise heart-rate and TCX tools. */
+  exerciseId: z.string().optional(),
   activityName: z.string().optional(),
+  exerciseType: z.string().optional(),
   activityTypeId: z.number().optional(),
+  /** Start instant in UTC (`...Z`). */
   startTime: z.string().optional(),
+  endTime: z.string().optional(),
+  /** Start as local wall clock with offset (`2026-09-26T11:15:20+05:00`). */
+  startTime_local: z.string().optional(),
+  endTime_local: z.string().optional(),
+  /** Active duration in milliseconds (pauses excluded). */
   duration: z.number().optional(),
+  activeDurationSec: z.number().optional(),
   calories: z.number().optional(),
   steps: z.number().optional(),
   distance: z.number().optional(),
   distanceUnit: z.string().optional(),
   averageHeartRate: z.number().optional(),
+  hasGps: z.boolean().optional(),
+  hasLaps: z.boolean().optional(),
+  /** True when the record is shorter than `min_duration_seconds`. */
+  suspected_accidental: z.boolean().optional(),
   heartRateZones: z.array(HeartRateZoneSchema).optional(),
 });
 export type ExerciseLog = z.infer<typeof ExerciseLogSchema>;
+
+export type ExerciseListOptions = {
+  /** Inclusive local dates. */
+  from?: string;
+  to?: string;
+  /** Legacy alias for `to`. */
+  beforeDate?: string;
+  limit?: number;
+};
 
 // ---------- Heart rate range ----------
 export const HeartRateDaySchema = z.object({
@@ -137,22 +160,125 @@ export const HeartRateDaySchema = z.object({
 });
 export type HeartRateDay = z.infer<typeof HeartRateDaySchema>;
 
-// ---------- Heart rate intraday ----------
+// ---------- Heart rate series (intraday, time range, exercise) ----------
 export const IntradayDetailLevel = z.enum(['1sec', '1min', '5min', '15min']);
 export type IntradayDetailLevelT = z.infer<typeof IntradayDetailLevel>;
 
-export const HeartRateIntradayPointSchema = z.object({
-  time: z.string(),
-  value: z.number(),
+export const HrResolutionSchema = z.enum(['raw', '5s', '15s', '1min']);
+export type HrResolutionT = z.infer<typeof HrResolutionSchema>;
+
+export const HeartRatePointSchema = z.object({
+  time_utc: z.string(),
+  time_local: z.string(),
+  /** Raw value, or the rounded bucket average. */
+  bpm: z.number(),
+  min: z.number().optional(),
+  max: z.number().optional(),
+  samples: z.number().optional(),
 });
+export type HeartRatePoint = z.infer<typeof HeartRatePointSchema>;
+
+export const TimeWindowSchema = z.object({
+  start_utc: z.string(),
+  end_utc: z.string(),
+  start_local: z.string(),
+  end_local: z.string(),
+});
+export type TimeWindow = z.infer<typeof TimeWindowSchema>;
+
+export const HeartRateSummarySchema = z.object({
+  avg: z.number().optional(),
+  min: z.number().optional(),
+  max: z.number().optional(),
+  pointCount: z.number(),
+  medianIntervalSec: z.number().optional(),
+});
+export type HeartRateSummary = z.infer<typeof HeartRateSummarySchema>;
+
 export const HeartRateIntradaySchema = z.object({
   date: z.string(),
+  timeZone: z.string().optional(),
   detailLevel: IntradayDetailLevel,
+  window: TimeWindowSchema.optional(),
   restingHeartRate: z.number().optional(),
   heartRateZones: z.array(HeartRateZoneSchema).optional(),
-  points: z.array(HeartRateIntradayPointSchema),
+  summary: HeartRateSummarySchema.optional(),
+  points: z.array(HeartRatePointSchema),
 });
 export type HeartRateIntraday = z.infer<typeof HeartRateIntradaySchema>;
+
+export const HeartRateSeriesSchema = z.object({
+  timeZone: z.string(),
+  resolution: HrResolutionSchema,
+  window: TimeWindowSchema,
+  summary: HeartRateSummarySchema,
+  points: z.array(HeartRatePointSchema),
+});
+export type HeartRateSeries = z.infer<typeof HeartRateSeriesSchema>;
+
+export const ZoneTimeSchema = z.object({
+  name: z.string(),
+  minBpm: z.number().optional(),
+  maxBpm: z.number().optional(),
+  seconds: z.number(),
+  percent: z.number().optional(),
+});
+
+export const ExerciseLapSchema = z.object({
+  index: z.number(),
+  splitType: z.string().optional(),
+  window: TimeWindowSchema,
+  activeDurationSec: z.number().optional(),
+  distanceKm: z.number().optional(),
+  googleAverageHeartRate: z.number().optional(),
+  heartRate: HeartRateSummarySchema,
+});
+
+export const ExerciseEventSchema = z.object({
+  type: z.string(),
+  time_utc: z.string(),
+  time_local: z.string(),
+});
+
+export const ExerciseHeartRateSchema = z.object({
+  exercise: ExerciseLogSchema.extend({ window: TimeWindowSchema }),
+  timeZone: z.string(),
+  resolution: HrResolutionSchema,
+  paddingMinutes: z.number(),
+  /** Summary over the session only; padding is excluded. */
+  summary: HeartRateSummarySchema,
+  zones: z.object({
+    /** Zone durations reported by Google for this workout. */
+    google: z.array(ZoneTimeSchema).optional(),
+    /** Zones as % of max heart rate (Bevel default method), computed here. */
+    computed: z
+      .object({
+        method: z.string(),
+        maxHr: z.number(),
+        maxHrSource: z.string(),
+        zones: z.array(ZoneTimeSchema),
+      })
+      .optional(),
+  }),
+  events: z.array(ExerciseEventSchema),
+  laps: z.array(ExerciseLapSchema),
+  points: z.array(HeartRatePointSchema),
+});
+export type ExerciseHeartRate = z.infer<typeof ExerciseHeartRateSchema>;
+
+export const ExerciseTcxSchema = z.object({
+  exerciseId: z.string(),
+  bytes: z.number(),
+  trackpointCount: z.number(),
+  heartRateTrackpointCount: z.number(),
+  hasPosition: z.boolean(),
+  truncated: z.boolean(),
+  tcx: z.string(),
+});
+export type ExerciseTcx = z.infer<typeof ExerciseTcxSchema>;
+
+/** How a tool names one exercise: Google id, or the numeric logId plus an optional date hint. */
+export type ExerciseRef = { exerciseId?: string; logId?: number; date?: string };
 
 // ---------- Sleep ----------
 export const SleepStageSchema = z.object({
@@ -405,7 +531,7 @@ export interface HealthProvider {
     start: string,
     end: string,
   ): Promise<TimeSeries>;
-  getExerciseList(opts: { beforeDate?: string; limit?: number }): Promise<ExerciseLog[]>;
+  getExerciseList(opts: ExerciseListOptions): Promise<ExerciseLog[]>;
   getHeartRateRange(start: string, end: string): Promise<HeartRateDay[]>;
   getHeartRateIntraday(date: string, detailLevel: IntradayDetailLevelT): Promise<HeartRateIntraday>;
   getSleep(date: string): Promise<SleepLog[]>;
@@ -417,6 +543,17 @@ export interface HealthProvider {
   getSkinTemperature(start: string, end: string): Promise<SkinTempDay[]>;
   getHRV(start: string, end: string): Promise<HrvDay[]>;
   getCardioFitness(date: string): Promise<CardioFitness>;
+  /** Optional: only the Google Health provider implements these. */
+  getHeartRateSeries?(
+    start: string,
+    end: string,
+    resolution: HrResolutionT,
+  ): Promise<HeartRateSeries>;
+  getExerciseHeartRate?(
+    ref: ExerciseRef,
+    opts: { resolution: HrResolutionT; paddingMinutes: number; maxHr?: number },
+  ): Promise<ExerciseHeartRate>;
+  exportExerciseTcx?(ref: ExerciseRef, opts: { partialData: boolean }): Promise<string>;
 
   // --- Write ---
   logFood(input: LogFoodInput): Promise<FoodLogEntry>;

@@ -57,7 +57,7 @@ export function registerActivityWriteTool(
         await invalidate(
           env,
           cacheKey('get_daily_summary', { date }),
-          cacheKey('get_exercise_list', { beforeDate: date }),
+          cacheKey('get_exercise_list.v2', { to: date }),
         );
         return {
           structuredContent: entry,
@@ -92,7 +92,7 @@ export function registerActivityWriteTool(
         await invalidate(
           env,
           cacheKey('get_daily_summary', { date: d }),
-          cacheKey('get_exercise_list', { beforeDate: d }),
+          cacheKey('get_exercise_list.v2', { to: d }),
         );
         return {
           structuredContent: { deleted: true, logId },

@@ -63,8 +63,16 @@ const WRITE_SCOPES = [
   'https://www.googleapis.com/auth/googlehealth.nutrition.writeonly',
 ];
 
+/** Added only with `--location`. Needed only by `export_exercise_tcx` (GPS routes). */
+const LOCATION_SCOPES = ['https://www.googleapis.com/auth/googlehealth.location.readonly'];
+
 const WITH_WRITE = process.argv.includes('--write');
-const SCOPES = WITH_WRITE ? [...READ_SCOPES, ...WRITE_SCOPES] : READ_SCOPES;
+const WITH_LOCATION = process.argv.includes('--location');
+const SCOPES = [
+  ...READ_SCOPES,
+  ...(WITH_WRITE ? WRITE_SCOPES : []),
+  ...(WITH_LOCATION ? LOCATION_SCOPES : []),
+];
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const WRANGLER_TOML = path.join(REPO_ROOT, 'wrangler.toml');

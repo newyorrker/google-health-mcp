@@ -85,7 +85,7 @@ export function zoneOffsetMs(instant: Date, timeZone?: string): number {
       get('minute'),
       get('second'),
     );
-    return asUtc - instant.getTime();
+    return Math.round((asUtc - instant.getTime()) / 60_000) * 60_000;
   } catch {
     return 0; // unknown zone -> behave as UTC
   }
@@ -124,6 +124,33 @@ export function toLocalTimeString(instant: Date | number, timeZone?: string): st
   } catch {
     return d.toISOString().slice(11, 19);
   }
+}
+
+const ZONED_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Parse an ISO 8601 instant that carries an explicit offset (`Z` or `+05:00`).
+ * A zone-less value is rejected: it is ambiguous, and guessing the zone is
+ * exactly how double-offset bugs start.
+ */
+export function parseZonedIso(value: string, field: string): number {
+  const ms = ZONED_ISO_RE.test(value) ? Date.parse(value) : Number.NaN;
+  if (!Number.isFinite(ms)) {
+    throw new RangeError(
+      `${field} must be ISO 8601 with an offset, e.g. 2026-09-26T11:15:00+05:00 (got: ${value})`,
+    );
+  }
+  return ms;
+}
+
+/** Cache lifetime: 5 minutes while the day is still open, 1 hour for past days. */
+export function cacheTtlForDate(date: string, timeZone?: string): number {
+  return date >= today(timeZone) ? 300 : 3600;
+}
+
+/** Same rule for an instant: data after local midnight today is still changing. */
+export function cacheTtlForInstant(ms: number, timeZone?: string): number {
+  return ms > localDayStartUtc(today(timeZone), timeZone).getTime() ? 300 : 3600;
 }
 
 const ISO_DATE_RE = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;

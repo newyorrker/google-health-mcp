@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { Env } from '../../env';
 import { cacheKey, getCached } from '../../lib/cache';
-import { normalizeRange } from '../../lib/date';
+import { cacheTtlForDate, normalizeRange } from '../../lib/date';
 import { toolErrorResult } from '../../lib/errors';
 import type { HealthProvider } from '../../providers/types';
 import { BodyFatLogSchema, WeightLogSchema } from '../../providers/types';
@@ -25,8 +25,11 @@ export function registerBodyReadTools(server: McpServer, provider: HealthProvide
     async ({ start, end }) => {
       try {
         const range = normalizeRange(start, end);
-        const body = await getCached(env, cacheKey('get_body_log', range), () =>
-          provider.getBodyLog(range.start, range.end),
+        const body = await getCached(
+          env,
+          cacheKey('get_body_log', range),
+          () => provider.getBodyLog(range.start, range.end),
+          { ttlSec: cacheTtlForDate(range.end) },
         );
         return {
           structuredContent: body,

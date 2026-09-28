@@ -13,13 +13,30 @@ export type GoogleHealthRequest = {
   query?: Record<string, string | number | undefined>;
   /** JSON request body for writes and the `:rollUp` / `:batchDelete` verbs. */
   json?: unknown;
+  /** Accept header. Defaults to JSON; the TCX export returns XML. */
+  accept?: string;
 };
 
 /** Maximum `dataPoints` pages walked by `listAll` before giving up. */
 const MAX_PAGES = 20;
 
 export class GoogleHealthClient {
+  /**
+   * One token lookup shared by parallel requests. Without it, a fan-out of
+   * heart-rate chunks near token expiry starts several refreshes at once, and
+   * KV rejects the extra writes to the same key.
+   */
+  private tokenPromise?: Promise<string>;
+
   constructor(private readonly env: Env) {}
+
+  private accessToken(): Promise<string> {
+    this.tokenPromise ??= getAccessToken(this.env).catch((err: unknown) => {
+      this.tokenPromise = undefined;
+      throw err;
+    });
+    return this.tokenPromise;
+  }
 
   async requestJson<T>(schema: ZodType<T>, req: GoogleHealthRequest): Promise<T> {
     const body = await this.requestText(req);
@@ -53,10 +70,10 @@ export class GoogleHealthClient {
     const MAX_ATTEMPTS = 3; // original + one token refresh + one rate-limit retry
     while (true) {
       attempt++;
-      const token = await getAccessToken(this.env);
+      const token = await this.accessToken();
       const headers: Record<string, string> = {
         Authorization: `Bearer ${token}`,
-        Accept: 'application/json',
+        Accept: req.accept ?? 'application/json',
       };
 
       let body: BodyInit | undefined;
@@ -72,6 +89,7 @@ export class GoogleHealthClient {
 
       if (res.status === 401 && attempt === 1) {
         console.log(`[google-health] ${method} ${req.path} → 401 after ${ms}ms, refreshing token`);
+        this.tokenPromise = undefined;
         await invalidateAccessToken(this.env);
         continue;
       }
@@ -105,11 +123,12 @@ export class GoogleHealthClient {
    * The API returns at most `pageSize` rows per call (25 for sleep/exercise,
    * up to 10000 elsewhere) and signals more with `nextPageToken`. `limit`
    * stops the walk early once enough rows are collected; MAX_PAGES bounds the
-   * worst case so a wide range cannot hang the Worker.
+   * worst case so a wide range cannot hang the Worker. `fields` is the
+   * standard Google field mask; it shrinks large listings a lot.
    */
   async listAll(
     dataType: string,
-    opts: { filter?: string; pageSize?: number; limit?: number } = {},
+    opts: { filter?: string; pageSize?: number; limit?: number; fields?: string } = {},
   ): Promise<unknown[]> {
     const out: unknown[] = [];
     let pageToken: string | undefined;
@@ -117,7 +136,7 @@ export class GoogleHealthClient {
     for (let page = 0; page < MAX_PAGES; page++) {
       const text = await this.requestText({
         path: `/users/me/dataTypes/${dataType}/dataPoints`,
-        query: { filter: opts.filter, pageSize: opts.pageSize, pageToken },
+        query: { filter: opts.filter, pageSize: opts.pageSize, pageToken, fields: opts.fields },
       });
       const body = JSON.parse(text) as {
         dataPoints?: unknown[];

@@ -107,6 +107,10 @@ export function toolErrorResult(err: unknown): ToolTextResult {
       'Re-run `pnpm run setup:google` from a developer machine and repopulate the TOKENS KV namespace. ' +
       'If this recurs roughly every 7 days, the OAuth consent screen is still in "Testing" — ' +
       'publish it to "In production" at https://console.cloud.google.com/auth/audience.';
+  } else if (err instanceof GoogleApiError && err.bodyText.includes('location_readonly')) {
+    hint =
+      '\n\nHint: TCX export needs the googlehealth.location.readonly scope. ' +
+      'Re-run `pnpm run setup:google -- --location` from a developer machine.';
   } else if (err instanceof GoogleRateLimitError) {
     hint = `\n\nHint: retry after ${err.retryAfterSec}s.`;
   } else if (err instanceof UnsupportedOperationError && err.suggestion) {

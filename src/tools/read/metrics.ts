@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { Env } from '../../env';
 import { cacheKey, getCached } from '../../lib/cache';
-import { assertIsoDate, normalizeRange, today } from '../../lib/date';
+import { assertIsoDate, cacheTtlForDate, normalizeRange, today } from '../../lib/date';
 import { toolErrorResult } from '../../lib/errors';
 import type { HealthProvider } from '../../providers/types';
 import {
@@ -32,8 +32,11 @@ export function registerMetricsReadTools(
     async ({ start, end }) => {
       try {
         const range = normalizeRange(start, end);
-        const days = await getCached(env, cacheKey('get_spo2', range), () =>
-          provider.getSpO2(range.start, range.end),
+        const days = await getCached(
+          env,
+          cacheKey('get_spo2', range),
+          () => provider.getSpO2(range.start, range.end),
+          { ttlSec: cacheTtlForDate(range.end) },
         );
         return {
           structuredContent: { days },
@@ -60,8 +63,11 @@ export function registerMetricsReadTools(
     async ({ start, end }) => {
       try {
         const range = normalizeRange(start, end);
-        const days = await getCached(env, cacheKey('get_respiratory_rate', range), () =>
-          provider.getRespiratoryRate(range.start, range.end),
+        const days = await getCached(
+          env,
+          cacheKey('get_respiratory_rate', range),
+          () => provider.getRespiratoryRate(range.start, range.end),
+          { ttlSec: cacheTtlForDate(range.end) },
         );
         return {
           structuredContent: { days },
@@ -88,8 +94,11 @@ export function registerMetricsReadTools(
     async ({ start, end }) => {
       try {
         const range = normalizeRange(start, end);
-        const days = await getCached(env, cacheKey('get_skin_temperature', range), () =>
-          provider.getSkinTemperature(range.start, range.end),
+        const days = await getCached(
+          env,
+          cacheKey('get_skin_temperature', range),
+          () => provider.getSkinTemperature(range.start, range.end),
+          { ttlSec: cacheTtlForDate(range.end) },
         );
         return {
           structuredContent: { days },
@@ -116,8 +125,11 @@ export function registerMetricsReadTools(
     async ({ start, end }) => {
       try {
         const range = normalizeRange(start, end);
-        const days = await getCached(env, cacheKey('get_hrv', range), () =>
-          provider.getHRV(range.start, range.end),
+        const days = await getCached(
+          env,
+          cacheKey('get_hrv', range),
+          () => provider.getHRV(range.start, range.end),
+          { ttlSec: cacheTtlForDate(range.end) },
         );
         return {
           structuredContent: { days },
@@ -144,8 +156,11 @@ export function registerMetricsReadTools(
       try {
         const d = date ?? today();
         assertIsoDate(d, 'date');
-        const data = await getCached(env, cacheKey('get_cardio_fitness', { date: d }), () =>
-          provider.getCardioFitness(d),
+        const data = await getCached(
+          env,
+          cacheKey('get_cardio_fitness', { date: d }),
+          () => provider.getCardioFitness(d),
+          { ttlSec: cacheTtlForDate(d) },
         );
         return {
           structuredContent: data,

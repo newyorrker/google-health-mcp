@@ -1,5 +1,12 @@
 import type { Env } from '../../env';
-import { toLocalTimeString } from '../../lib/date';
+import { getCached } from '../../lib/cache';
+import {
+  localDayStartUtc,
+  parseZonedIso,
+  today,
+  toLocalDateString,
+  zoneOffsetMs,
+} from '../../lib/date';
 import { UnsupportedOperationError } from '../../lib/errors';
 import type {
   ActivityResourceT,
@@ -8,13 +15,18 @@ import type {
   CardioFitness,
   DailySummary,
   Device,
+  ExerciseHeartRate,
+  ExerciseListOptions,
   ExerciseLog,
+  ExerciseRef,
   FoodLog,
   FoodLogEntry,
   HealthProvider,
   HeartRateDay,
   HeartRateIntraday,
+  HeartRateSeries,
   HeartRateZone,
+  HrResolutionT,
   HrvDay,
   IntradayDetailLevelT,
   LogActivityInput,
@@ -30,11 +42,25 @@ import type {
   SleepLog,
   SpO2Day,
   TimeSeries,
+  TimeWindow,
   WaterLogEntry,
   WeightLog,
 } from '../types';
 import { addDays, GoogleHealthClient, maxPageSize, rollupRangeCapDays } from './client';
-import { dayRangeFilter, type TimeField } from './filters';
+import { dayRangeFilter, filterPath, type TimeField } from './filters';
+import {
+  bucketize,
+  HR_FIELDS,
+  type HrSample,
+  isoLocal,
+  isoUtc,
+  parseHrRows,
+  percentMaxZones,
+  RESOLUTION_SEC,
+  sliceByTime,
+  summarize,
+  timeInZones,
+} from './hr-series';
 import {
   durationMs,
   fromCivilDate,
@@ -50,6 +76,19 @@ import {
 } from './map';
 
 type Row = Record<string, unknown>;
+
+/** Heart-rate listings are split into windows of this size (see heartRateSamples). */
+const HR_CHUNK_MS = 2 * 3_600_000;
+/** How many heart-rate windows are fetched at the same time. */
+const HR_CONCURRENCY = 4;
+/** Longest window one series request may cover. */
+const MAX_SERIES_MS = 24 * 3_600_000;
+/** How far back exercise lookups go when no date is given. */
+const EXERCISE_LOOKBACK_DAYS = 90;
+/** Longest `from`..`to` window for the exercise list; keeps it under the page cap. */
+const MAX_EXERCISE_RANGE_DAYS = 180;
+/** Exercise ids are opaque tokens; this also blocks path injection. */
+const EXERCISE_ID_RE = /^[A-Za-z0-9_-]+$/;
 
 /**
  * Fitbit's activity time-series resources mapped onto Google Health data
@@ -84,7 +123,7 @@ export class GoogleHealthProvider implements HealthProvider {
    */
   private readonly timeZone: string;
 
-  constructor(env: Env) {
+  constructor(private readonly env: Env) {
     this.client = new GoogleHealthClient(env);
     this.timeZone = env.TIMEZONE?.trim() || 'UTC';
   }
@@ -180,6 +219,101 @@ export class GoogleHealthProvider implements HealthProvider {
         `Split the range into chunks of ${cap} days or fewer.`,
       );
     }
+  }
+
+  /**
+   * The user's IANA zone from Google settings, cached for a day. Falls back to
+   * the TIMEZONE variable when settings are not readable. A failed request
+   * throws inside the fetcher, so the fallback is never cached.
+   */
+  private async userTimeZone(): Promise<string> {
+    try {
+      return await getCached(
+        this.env,
+        'google_settings_timezone',
+        async () => {
+          const text = await this.client.requestText({ path: '/users/me/settings' });
+          const tz = (JSON.parse(text) as Row).timeZone;
+          if (typeof tz !== 'string' || tz === '') throw new Error('settings has no timeZone');
+          return tz;
+        },
+        { ttlSec: 86_400 },
+      );
+    } catch {
+      return this.timeZone;
+    }
+  }
+
+  /**
+   * Raw heart-rate samples in `[startMs, endMs)`, oldest first.
+   *
+   * The range is split into 2-hour windows. One window fits in one or two
+   * pages (the API caps a page at 5000 points), and the windows are fetched a
+   * few at a time. The field mask drops everything except time and value.
+   * A single unsplit day listing is newest-first and gets cut by the page
+   * limit, which is how the morning used to go missing.
+   */
+  private async heartRateSamples(
+    startMs: number,
+    endMs: number,
+    fallbackOffsetMs: number,
+  ): Promise<HrSample[]> {
+    const path = filterPath('heart-rate', 'sample');
+    const windows: Array<[number, number]> = [];
+    for (let a = startMs; a < endMs; a += HR_CHUNK_MS) {
+      windows.push([a, Math.min(a + HR_CHUNK_MS, endMs)]);
+    }
+    const parts = await mapLimit(windows, HR_CONCURRENCY, async ([a, b]) => {
+      const rows = await this.client.listAll('heart-rate', {
+        filter: `${path} >= "${isoUtc(a)}" AND ${path} < "${isoUtc(b)}"`,
+        pageSize: maxPageSize('heart-rate'),
+        fields: HR_FIELDS,
+      });
+      return parseHrRows(rows, fallbackOffsetMs);
+    });
+    // Each part is sorted and the windows are in order, so the join is sorted.
+    return parts.flat();
+  }
+
+  /** A time window as UTC and local ISO strings, local per the given zone. */
+  private static window(startMs: number, endMs: number, timeZone: string): TimeWindow {
+    return {
+      start_utc: isoUtc(startMs),
+      end_utc: isoUtc(endMs),
+      start_local: isoLocal(startMs, zoneOffsetMs(new Date(startMs), timeZone)),
+      end_local: isoLocal(endMs, zoneOffsetMs(new Date(endMs), timeZone)),
+    };
+  }
+
+  /**
+   * Load one exercise data point.
+   *
+   * A Google id is fetched directly. A numeric logId is a hash of the resource
+   * name, so it is found by scanning a window of exercises: three days around
+   * `date` when given, else the last 90 days.
+   */
+  private async findExercise(ref: ExerciseRef): Promise<Row> {
+    if (ref.exerciseId) {
+      const id = exerciseIdOf(ref.exerciseId);
+      const text = await this.client.requestText({
+        path: `/users/me/dataTypes/exercise/dataPoints/${id}`,
+      });
+      return JSON.parse(text) as Row;
+    }
+    if (ref.logId === undefined) {
+      throw new RangeError('Pass exerciseId (preferred) or logId.');
+    }
+    const end = ref.date ? addDays(ref.date, 1) : today(this.timeZone);
+    const start = ref.date ? addDays(ref.date, -1) : addDays(end, -EXERCISE_LOOKBACK_DAYS);
+    const rows = await this.list('exercise', 'interval', start, end);
+    const match = rows.find((r) => nameToNumericId(r.name) === ref.logId);
+    if (!match) {
+      throw new UnsupportedOperationError(
+        `No exercise with logId ${ref.logId} was found between ${start} and ${end}.`,
+        'Call get_exercise_list and pass its exerciseId, or add the workout date.',
+      );
+    }
+    return match;
   }
 
   // ------------------------------------------------------------------ read
@@ -304,29 +438,25 @@ export class GoogleHealthProvider implements HealthProvider {
     return { resource, points };
   }
 
-  async getExerciseList(opts: { beforeDate?: string; limit?: number }): Promise<ExerciseLog[]> {
-    // Fitbit paged backwards from a date; Google filters a window instead, so
-    // a 90-day lookback stands in for "the most recent N".
-    const end = opts.beforeDate ?? new Date().toISOString().slice(0, 10);
-    const start = addDays(end, -90);
-    const rows = await this.list('exercise', 'interval', start, end, { limit: opts.limit ?? 20 });
-
-    return rows.map((row) => {
-      const e = GoogleHealthProvider.unwrap(row, 'exercise');
-      const metrics = (e.metricsSummary ?? {}) as Row;
-      const distanceMm = num(metrics.distanceMillimeters);
-      return {
-        logId: nameToNumericId(e.__name),
-        activityName: (e.displayName as string) ?? (e.exerciseType as string) ?? undefined,
-        startTime: pointTimestamp(e),
-        duration: durationMs(e.activeDuration),
-        calories: num(metrics.caloriesKcal),
-        steps: num(metrics.steps),
-        distance: distanceMm === undefined ? undefined : distanceMm / 1_000_000,
-        distanceUnit: 'km',
-        averageHeartRate: num(metrics.averageHeartRateBeatsPerMinute),
-      };
-    });
+  async getExerciseList(opts: ExerciseListOptions): Promise<ExerciseLog[]> {
+    // Google filters a window instead of paging back from a date. Without
+    // `from`, a 90-day lookback stands in for "the most recent N".
+    const to = opts.to ?? opts.beforeDate ?? today(this.timeZone);
+    const from = opts.from ?? addDays(to, -EXERCISE_LOOKBACK_DAYS);
+    if (from > to) throw new RangeError(`Range is inverted: from=${from} > to=${to}`);
+    if (from < addDays(to, -MAX_EXERCISE_RANGE_DAYS)) {
+      throw new RangeError(
+        `The range is longer than ${MAX_EXERCISE_RANGE_DAYS} days. Split it into shorter ranges.`,
+      );
+    }
+    const fallbackOff = zoneOffsetMs(new Date(), this.timeZone);
+    const rows = await this.list('exercise', 'interval', from, to, { limit: opts.limit });
+    const out: ExerciseLog[] = [];
+    for (const row of rows) {
+      const rec = readExercise(row, fallbackOff);
+      if (rec) out.push(rec.log);
+    }
+    return out;
   }
 
   async getHeartRateRange(start: string, end: string): Promise<HeartRateDay[]> {
@@ -341,46 +471,163 @@ export class GoogleHealthProvider implements HealthProvider {
     date: string,
     detailLevel: IntradayDetailLevelT,
   ): Promise<HeartRateIntraday> {
-    // Google exposes raw ~5-second samples with no detailLevel buckets, so the
-    // requested granularity is produced here by down-sampling.
-    const bucketSec = { '1sec': 1, '1min': 60, '5min': 300, '15min': 900 }[detailLevel];
-    const rows = await this.list('heart-rate', 'sample', date, date);
+    // Google stores raw samples only, every 1-5 s during a workout and less
+    // often at rest. 1sec returns them as they are; the other levels average
+    // them into buckets here.
+    const bucketSec = { '1sec': 0, '1min': 60, '5min': 300, '15min': 900 }[detailLevel];
+    const tz = await this.userTimeZone();
+    const dayStart = localDayStartUtc(date, tz).getTime();
+    const dayEnd = localDayStartUtc(addDays(date, 1), tz).getTime();
+    // No point asking for the future part of today.
+    const fetchEnd = Math.min(dayEnd, Date.now());
+    const offset = zoneOffsetMs(new Date(dayStart), tz);
 
-    const buckets = new Map<number, { sum: number; n: number }>();
-    for (const row of rows) {
-      const hr = GoogleHealthProvider.unwrap(row, 'heartRate');
-      const bpm = num(hr.beatsPerMinute);
-      const ts = pointTimestamp(hr);
-      if (bpm === undefined || !ts) continue;
-      const ms = Date.parse(ts.endsWith('Z') ? ts : `${ts}Z`);
-      if (!Number.isFinite(ms)) continue;
-      const key = Math.floor(ms / 1000 / bucketSec) * bucketSec;
-      const b = buckets.get(key) ?? { sum: 0, n: 0 };
-      b.sum += bpm;
-      b.n += 1;
-      buckets.set(key, b);
-    }
-
-    const points = [...buckets.entries()]
-      .sort(([a], [b]) => a - b)
-      .map(([key, b]) => ({
-        // Local wall-clock, so a reading taken at 09:00 reads as 09:00.
-        time: toLocalTimeString(key * 1000, this.timeZone),
-        value: Math.round(b.sum / b.n),
-      }));
-
-    const [rhr, azm] = await Promise.all([
+    const [samples, rhr, azm] = await Promise.all([
+      fetchEnd > dayStart
+        ? this.heartRateSamples(dayStart, fetchEnd, offset)
+        : Promise.resolve([] as HrSample[]),
       this.listPayloads('daily-resting-heart-rate', 'daily', date, date).catch(() => []),
       this.client.dailyRollUp('active-zone-minutes', date, date).catch(() => []),
     ]);
 
     return {
       date,
+      timeZone: tz,
       detailLevel,
+      window: GoogleHealthProvider.window(dayStart, dayEnd, tz),
       restingHeartRate: num((rhr[0] as Row | undefined)?.beatsPerMinute),
       heartRateZones: readAzmZones(azm[0]),
-      points,
+      summary: summarize(samples),
+      points: bucketize(samples, bucketSec),
     };
+  }
+
+  async getHeartRateSeries(
+    start: string,
+    end: string,
+    resolution: HrResolutionT,
+  ): Promise<HeartRateSeries> {
+    const startMs = parseZonedIso(start, 'start');
+    const endMs = parseZonedIso(end, 'end');
+    assertSeriesWindow(startMs, endMs);
+    const tz = await this.userTimeZone();
+    const samples = await this.heartRateSamples(
+      startMs,
+      endMs,
+      zoneOffsetMs(new Date(startMs), tz),
+    );
+    return {
+      timeZone: tz,
+      resolution,
+      window: GoogleHealthProvider.window(startMs, endMs, tz),
+      summary: summarize(samples),
+      points: bucketize(samples, RESOLUTION_SEC[resolution]),
+    };
+  }
+
+  async getExerciseHeartRate(
+    ref: ExerciseRef,
+    opts: { resolution: HrResolutionT; paddingMinutes: number; maxHr?: number },
+  ): Promise<ExerciseHeartRate> {
+    const tz = await this.userTimeZone();
+    const rec = readExercise(await this.findExercise(ref), zoneOffsetMs(new Date(), tz));
+    if (!rec) throw new UnsupportedOperationError('This exercise has no valid start and end time.');
+
+    // `+ 1000` keeps a sample stamped at the exact stop second.
+    const pad = opts.paddingMinutes * 60_000;
+    const from = rec.startMs - pad;
+    const to = rec.endMs + pad + 1000;
+    assertSeriesWindow(from, to);
+
+    const [samples, age] = await Promise.all([
+      this.heartRateSamples(from, to, rec.offMs),
+      opts.maxHr
+        ? Promise.resolve(undefined)
+        : this.getJsonOrEmpty('/users/me/profile').then((p) => num(p.age)),
+    ]);
+
+    // Statistics cover the session only; padding is for context in `points`.
+    const session = sliceByTime(samples, rec.startMs, rec.endMs + 1000);
+    const e = rec.raw;
+    const metrics = (e.metricsSummary ?? {}) as Row;
+
+    const maxHr = opts.maxHr ?? (age ? 220 - age : undefined);
+    const computed =
+      maxHr === undefined
+        ? undefined
+        : {
+            method: 'percent of max heart rate (Bevel default zones)',
+            maxHr,
+            maxHrSource: opts.maxHr ? 'max_hr input' : `220 - age (${age})`,
+            zones: timeInZones(session, percentMaxZones(maxHr), rec.endMs),
+          };
+
+    const events = ((e.exerciseEvents as Row[] | undefined) ?? []).flatMap((ev) => {
+      const t = Date.parse(ev.eventTime as string);
+      if (!Number.isFinite(t)) return [];
+      const off = durationMs(ev.eventUtcOffset) ?? rec.offMs;
+      return [
+        {
+          type: String(ev.exerciseEventType ?? ''),
+          time_utc: isoUtc(t),
+          time_local: isoLocal(t, off),
+        },
+      ];
+    });
+
+    const laps = ((e.splitSummaries as Row[] | undefined) ?? []).flatMap((sp, index) => {
+      const a = Date.parse(sp.startTime as string);
+      const b = Date.parse(sp.endTime as string);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) return [];
+      const off = durationMs(sp.startUtcOffset) ?? rec.offMs;
+      const m = (sp.metricsSummary ?? {}) as Row;
+      const mm = num(m.distanceMillimeters);
+      const active = durationMs(sp.activeDuration);
+      return [
+        {
+          index: index + 1,
+          splitType: (sp.splitType as string) ?? undefined,
+          window: {
+            start_utc: isoUtc(a),
+            end_utc: isoUtc(b),
+            start_local: isoLocal(a, off),
+            end_local: isoLocal(b, durationMs(sp.endUtcOffset) ?? off),
+          },
+          activeDurationSec: active === undefined ? undefined : Math.round(active / 1000),
+          distanceKm: mm === undefined ? undefined : mm / 1_000_000,
+          googleAverageHeartRate: num(m.averageHeartRateBeatsPerMinute),
+          heartRate: summarize(sliceByTime(session, a, b)),
+        },
+      ];
+    });
+
+    return {
+      exercise: { ...rec.log, window: rec.window },
+      timeZone: tz,
+      resolution: opts.resolution,
+      paddingMinutes: opts.paddingMinutes,
+      summary: summarize(session),
+      zones: { google: readGoogleZones(metrics.heartRateZoneDurations), computed },
+      events,
+      laps,
+      points: bucketize(samples, RESOLUTION_SEC[opts.resolution]),
+    };
+  }
+
+  async exportExerciseTcx(ref: ExerciseRef, opts: { partialData: boolean }): Promise<string> {
+    const id = ref.exerciseId
+      ? exerciseIdOf(ref.exerciseId)
+      : exerciseIdOf(String((await this.findExercise(ref)).name ?? ''));
+    const text = await this.client.requestText({
+      path: `/users/me/dataTypes/exercise/dataPoints/${id}:exportExerciseTcx`,
+      query: { alt: 'media', partialData: String(opts.partialData) },
+      accept: 'application/vnd.garmin.tcx+xml, application/xml, application/json',
+    });
+    // Without alt=media the API wraps the file as {"tcxData": "..."}.
+    if (text.trimStart().startsWith('{')) {
+      return String((JSON.parse(text) as Row).tcxData ?? '');
+    }
+    return text;
   }
 
   async getSleep(date: string): Promise<SleepLog[]> {
@@ -412,7 +659,12 @@ export class GoogleHealthProvider implements HealthProvider {
 
       return {
         logId: nameToNumericId(s.__name),
-        dateOfSleep: fromCivilDate((interval.civilEndTime as Row | undefined)?.date) ?? end,
+        // A night belongs to the local day it ends on. The API sends no
+        // civil end time for sleep, so derive it from the end instant.
+        dateOfSleep:
+          fromCivilDate((interval.civilEndTime as Row | undefined)?.date) ??
+          localDateOf(endTime, interval.endUtcOffset, this.timeZone) ??
+          end,
         startTime,
         endTime,
         duration: spanMs,
@@ -819,6 +1071,129 @@ export class GoogleHealthProvider implements HealthProvider {
 }
 
 // -------------------------------------------------------------- local utils
+
+/** Run `fn` over `items` with at most `limit` calls in flight. Keeps order. */
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i] as T);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
+function assertSeriesWindow(startMs: number, endMs: number): void {
+  if (endMs <= startMs) throw new RangeError('end must be later than start.');
+  const hours = (endMs - startMs) / 3_600_000;
+  if (endMs - startMs > MAX_SERIES_MS) {
+    throw new RangeError(
+      `The window is ${hours.toFixed(1)} hours long. The maximum is 24 hours per request; split it into shorter windows.`,
+    );
+  }
+}
+
+/** Last segment of a resource name or a bare id, validated. */
+function exerciseIdOf(value: string): string {
+  const id = value.split('/').pop() ?? '';
+  if (!EXERCISE_ID_RE.test(id)) {
+    throw new RangeError(`exerciseId must be the id from get_exercise_list (got: ${value}).`);
+  }
+  return id;
+}
+
+/** Local `YYYY-MM-DD` of an instant, from its own offset when known. */
+function localDateOf(iso: string, offset: unknown, timeZone: string): string | undefined {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return undefined;
+  const off = durationMs(offset);
+  return off === undefined ? toLocalDateString(t, timeZone) : isoUtc(t + off).slice(0, 10);
+}
+
+type ExerciseRecord = {
+  log: ExerciseLog;
+  window: TimeWindow;
+  startMs: number;
+  endMs: number;
+  /** UTC offset at the start, in milliseconds. */
+  offMs: number;
+  /** The unwrapped `exercise` payload. */
+  raw: Row;
+};
+
+/** Map one exercise data point. Times come as UTC plus local with offset. */
+function readExercise(row: Row, fallbackOffsetMs: number): ExerciseRecord | undefined {
+  const e = (row.exercise ?? {}) as Row;
+  const interval = (e.interval ?? {}) as Row;
+  const startMs = Date.parse(interval.startTime as string);
+  const endMs = Date.parse(interval.endTime as string);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return undefined;
+
+  const offMs = durationMs(interval.startUtcOffset) ?? fallbackOffsetMs;
+  const endOffMs = durationMs(interval.endUtcOffset) ?? offMs;
+  const window: TimeWindow = {
+    start_utc: isoUtc(startMs),
+    end_utc: isoUtc(endMs),
+    start_local: isoLocal(startMs, offMs),
+    end_local: isoLocal(endMs, endOffMs),
+  };
+
+  const metrics = (e.metricsSummary ?? {}) as Row;
+  const distanceMm = num(metrics.distanceMillimeters);
+  const activeMs = durationMs(e.activeDuration);
+  const name = typeof row.name === 'string' ? row.name : '';
+  const splits = e.splitSummaries;
+
+  const log: ExerciseLog = {
+    logId: nameToNumericId(name),
+    exerciseId: name.split('/').pop() || undefined,
+    activityName: (e.displayName as string) ?? (e.exerciseType as string) ?? undefined,
+    exerciseType: (e.exerciseType as string) ?? undefined,
+    startTime: window.start_utc,
+    endTime: window.end_utc,
+    startTime_local: window.start_local,
+    endTime_local: window.end_local,
+    duration: activeMs,
+    activeDurationSec: activeMs === undefined ? undefined : Math.round(activeMs / 1000),
+    calories: num(metrics.caloriesKcal),
+    steps: num(metrics.steps),
+    distance: distanceMm === undefined ? undefined : distanceMm / 1_000_000,
+    distanceUnit: 'km',
+    averageHeartRate: num(metrics.averageHeartRateBeatsPerMinute),
+    hasGps: (e.exerciseMetadata as Row | undefined)?.hasGps === true,
+    hasLaps: Array.isArray(splits) && splits.length > 0,
+  };
+  return { log, window, startMs, endMs, offMs, raw: e };
+}
+
+/** Google's own zone durations for one workout (`heartRateZoneDurations`). */
+const GOOGLE_ZONE_FIELDS: Array<[field: string, name: string]> = [
+  ['lightTime', 'Light'],
+  ['moderateTime', 'Moderate'],
+  ['vigorousTime', 'Vigorous'],
+  ['peakTime', 'Peak'],
+];
+
+function readGoogleZones(
+  durations: unknown,
+): Array<{ name: string; seconds: number; percent: number }> | undefined {
+  if (!durations || typeof durations !== 'object') return undefined;
+  const d = durations as Row;
+  const zones = GOOGLE_ZONE_FIELDS.map(([field, name]) => ({
+    name,
+    seconds: Math.round((durationMs(d[field]) ?? 0) / 1000),
+  }));
+  const total = zones.reduce((a, z) => a + z.seconds, 0);
+  if (total === 0) return undefined;
+  return zones.map((z) => ({ ...z, percent: Math.round((z.seconds / total) * 1000) / 10 }));
+}
 
 /** Pull a named field out of a rollup bucket, whatever nesting it arrives in. */
 function pickRollup(bucket: Row | undefined, field: string): unknown {
