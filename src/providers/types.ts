@@ -49,6 +49,8 @@ export const HeartRateZoneSchema = z.object({
   caloriesOut: z.number().optional(),
   /** "computed" = bounds worked out here (Karvonen), not read from the API. */
   source: z.string().optional(),
+  /** "google" = Google zone minutes; "computed" = worked out here (Out of Range). */
+  minutesSource: z.string().optional(),
 });
 export type HeartRateZone = z.infer<typeof HeartRateZoneSchema>;
 
@@ -82,6 +84,8 @@ export const DailySummarySchema = z.object({
     veryActiveMinutes: NumOpt,
     restingHeartRate: NumOpt,
     heartRateZones: z.array(HeartRateZoneSchema).optional(),
+    /** Minutes of the day without heart-rate data (watch off or not worn). */
+    minutesWithoutHeartRate: NumOpt,
     marginalCalories: NumOpt,
   }),
 });
@@ -158,6 +162,8 @@ export const HeartRateDaySchema = z.object({
   value: z.object({
     restingHeartRate: z.number().optional(),
     heartRateZones: z.array(HeartRateZoneSchema).optional(),
+    /** Minutes of the day without heart-rate data (watch off or not worn). */
+    minutesWithoutHeartRate: z.number().optional(),
     customHeartRateZones: z.array(HeartRateZoneSchema).optional(),
   }),
 });
@@ -216,6 +222,8 @@ export const HeartRateIntradaySchema = z.object({
   window: TimeWindowSchema.optional(),
   restingHeartRate: z.number().optional(),
   heartRateZones: z.array(HeartRateZoneSchema).optional(),
+  /** Minutes of the whole day without heart-rate data (watch off or not worn). */
+  minutesWithoutHeartRate: z.number().optional(),
   zoneBasis: ZoneBasisSchema.optional(),
   summary: HeartRateSummarySchema.optional(),
   points: z.array(HeartRatePointSchema),
@@ -236,8 +244,9 @@ export type HeartRateSeries = z.infer<typeof HeartRateSeriesSchema>;
 
 export const ZoneTimeSchema = z.object({
   name: z.string(),
-  minBpm: z.number().optional(),
-  maxBpm: z.number().optional(),
+  /** Bounds in bpm, same meaning as in HeartRateZoneSchema. */
+  min: z.number().optional(),
+  max: z.number().optional(),
   seconds: z.number(),
   minutes: z.number().optional(),
   percent: z.number().optional(),
@@ -282,6 +291,7 @@ export type ExerciseHeartRate = z.infer<typeof ExerciseHeartRateSchema>;
 
 export const ExerciseTcxSchema = z.object({
   exerciseId: z.string(),
+  logId: z.number(),
   bytes: z.number(),
   trackpointCount: z.number(),
   heartRateTrackpointCount: z.number(),
@@ -571,7 +581,10 @@ export interface HealthProvider {
     ref: ExerciseRef,
     opts: { resolution: HrResolutionT; paddingMinutes: number; maxHr?: number },
   ): Promise<ExerciseHeartRate>;
-  exportExerciseTcx?(ref: ExerciseRef, opts: { partialData: boolean }): Promise<string>;
+  exportExerciseTcx?(
+    ref: ExerciseRef,
+    opts: { partialData: boolean },
+  ): Promise<{ exerciseId: string; logId: number; tcx: string }>;
 
   // --- Write ---
   logFood(input: LogFoodInput): Promise<FoodLogEntry>;

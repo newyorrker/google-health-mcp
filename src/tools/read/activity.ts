@@ -1,7 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { Env } from '../../env';
-import { cacheKey, getCached } from '../../lib/cache';
+import { cacheGeneration, cacheKey, getCached } from '../../lib/cache';
 import { assertIsoDate, cacheTtlForDate, normalizeRange, today } from '../../lib/date';
 import { toolErrorResult, UnsupportedOperationError } from '../../lib/errors';
 import type { HealthProvider } from '../../providers/types';
@@ -12,6 +12,12 @@ import {
   ExerciseTcxSchema,
   TimeSeriesSchema,
 } from '../../providers/types';
+
+/** Cache key name of get_daily_summary. Write tools clear it, so keep it in one place. */
+export const DAILY_SUMMARY_CACHE = 'get_daily_summary.v2';
+
+/** Cache group of get_exercise_list. Write tools bump its generation. */
+export const EXERCISE_LIST_CACHE = 'get_exercise_list.v3';
 
 /** Records shorter than this are flagged as probably started by accident. */
 const ACCIDENTAL_SEC = 60;
@@ -38,7 +44,7 @@ export function registerActivityReadTools(
         assertIsoDate(d, 'date');
         const data = await getCached(
           env,
-          cacheKey('get_daily_summary', { date: d }),
+          cacheKey(DAILY_SUMMARY_CACHE, { date: d }),
           () => provider.getDailySummary(d),
           { ttlSec: cacheTtlForDate(d) },
         );
@@ -92,7 +98,7 @@ export function registerActivityReadTools(
       title: 'Exercise logs',
       description:
         'Exercise / activity logs (runs, walks, workouts), newest first. Filter by local dates with from / to (inclusive; default: the last 90 days up to today). ' +
-        'Each entry has exerciseId, startTime / endTime in UTC, startTime_local / endTime_local with offset, activeDurationSec, distance (km), calories, averageHeartRate, hasGps and hasLaps. ' +
+        'Each entry has exerciseId (Google id, string) and logId (number), startTime / endTime in UTC, startTime_local / endTime_local with offset, activeDurationSec (moving time, pauses excluded), distance (km), calories, averageHeartRate, hasGps and hasLaps. ' +
         'Records shorter than min_duration_seconds (default 60) are usually accidental starts; they are hidden and counted in hiddenShortCount. With min_duration_seconds = 0 all records are returned, and records shorter than 60 s have suspected_accidental = true. ' +
         'Pass exerciseId to get_exercise_heart_rate or export_exercise_tcx. Past ranges are cached 1h, ranges that include today 5 min.',
       inputSchema: {
@@ -104,13 +110,13 @@ export function registerActivityReadTools(
           .int()
           .min(1)
           .max(100)
-          .optional()
+          .default(20)
           .describe('Entries to return after filtering. Default 20, max 100.'),
         min_duration_seconds: z
           .number()
           .int()
           .min(0)
-          .optional()
+          .default(ACCIDENTAL_SEC)
           .describe(
             'Records shorter than this are hidden and counted in hiddenShortCount. Default 60. 0 returns all records; records shorter than 60 s are then flagged suspected_accidental=true.',
           ),
@@ -125,14 +131,15 @@ export function registerActivityReadTools(
         const end = to ?? beforeDate ?? today();
         assertIsoDate(end, 'to');
         if (from) assertIsoDate(from, 'from');
+        const gen = await cacheGeneration(env, EXERCISE_LIST_CACHE);
         const all = await getCached(
           env,
-          cacheKey('get_exercise_list.v2', { from, to: end }),
+          cacheKey(EXERCISE_LIST_CACHE, { from, to: end, gen }),
           () => provider.getExerciseList({ from, to: end }),
           { ttlSec: cacheTtlForDate(end) },
         );
 
-        const minSec = min_duration_seconds ?? 60;
+        const minSec = min_duration_seconds;
         let hiddenShortCount = 0;
         const exercises = [];
         for (const ex of all) {
@@ -145,7 +152,7 @@ export function registerActivityReadTools(
           const accidental = sec !== undefined && sec < ACCIDENTAL_SEC;
           exercises.push(accidental ? { ...ex, suspected_accidental: true } : ex);
         }
-        const data = { exercises: exercises.slice(0, limit ?? 20), hiddenShortCount };
+        const data = { exercises: exercises.slice(0, limit), hiddenShortCount };
         return {
           structuredContent: data,
           content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
@@ -194,14 +201,14 @@ export function registerActivityReadTools(
         if (date) assertIsoDate(date, 'date');
         const ref = { exerciseId, logId, date };
         const partialData = partial_data ?? true;
-        const xml = await getCached(
+        const { tcx: xml, ...ids } = await getCached(
           env,
-          cacheKey('export_exercise_tcx', { ...ref, partialData }),
+          cacheKey('export_exercise_tcx.v2', { ...ref, partialData }),
           () => exportTcx(ref, { partialData }),
         );
         const limitChars = max_chars ?? 100_000;
         const data = {
-          exerciseId: exerciseId ?? String(logId ?? ''),
+          ...ids,
           bytes: xml.length,
           trackpointCount: countTag(xml, '<Trackpoint>'),
           heartRateTrackpointCount: countTag(xml, '<HeartRateBpm'),

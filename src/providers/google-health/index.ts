@@ -270,6 +270,45 @@ export class GoogleHealthProvider implements HealthProvider {
   }
 
   /**
+   * Minutes with and without heart-rate data per local date. One 1-minute
+   * heart-rate rollup per day (about 1 s each), a few days at a time, with a
+   * field mask that keeps only the bucket start. Undefined on any error, so
+   * a failed day never looks like a day without data.
+   */
+  private async heartRateCoverageByDay(
+    start: string,
+    end: string,
+  ): Promise<Map<string, { withData: number; withoutData: number }> | undefined> {
+    try {
+      const tz = await this.userTimeZone();
+      const now = Date.now();
+      const dates: string[] = [];
+      for (let d = start; d <= end; d = addDays(d, 1)) dates.push(d);
+      const days = await mapLimit(dates, HR_CONCURRENCY, async (date) => {
+        const from = localDayStartUtc(date, tz).getTime();
+        const dayEnd = localDayStartUtc(addDays(date, 1), tz).getTime();
+        const to = Math.min(dayEnd, now);
+        const buckets =
+          to > from
+            ? await this.client.rollUp(
+                'heart-rate',
+                new Date(from).toISOString(),
+                new Date(to).toISOString(),
+                '60s',
+                'rollupDataPoints(startTime),nextPageToken',
+              )
+            : [];
+        const withData = buckets.length;
+        const total = Math.max(0, Math.floor((to - from) / 60_000));
+        return [date, { withData, withoutData: Math.max(0, total - withData) }] as const;
+      });
+      return new Map(days);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Resting heart rate around a date: `onDate` is that date's own value, and
    * `latest` is the newest value in the week up to it (for zone bounds, so a
    * day without a resting value still gets zones).
@@ -422,16 +461,19 @@ export class GoogleHealthProvider implements HealthProvider {
     // Fitbit served this from one endpoint; Google needs one rollup per
     // metric. They are independent, so fire them together and let a single
     // unavailable metric come back undefined rather than failing the summary.
-    const [steps, calories, distance, floors, activity, azm, rhr, age] = await Promise.all([
-      this.client.dailyRollUp('steps', date, date).catch(() => []),
-      this.client.dailyRollUp('total-calories', date, date).catch(() => []),
-      this.client.dailyRollUp('distance', date, date).catch(() => []),
-      this.client.dailyRollUp('floors', date, date).catch(() => []),
-      this.activityLevelMinutesByDay(date, date).catch(() => new Map()),
-      this.client.dailyRollUp('active-zone-minutes', date, date).catch(() => []),
-      this.restingHrNear(date),
-      this.profileAge(),
-    ]);
+    const [steps, calories, distance, floors, activity, azm, rhr, age, coverage] =
+      await Promise.all([
+        this.client.dailyRollUp('steps', date, date).catch(() => []),
+        this.client.dailyRollUp('total-calories', date, date).catch(() => []),
+        this.client.dailyRollUp('distance', date, date).catch(() => []),
+        this.client.dailyRollUp('floors', date, date).catch(() => []),
+        this.activityLevelMinutesByDay(date, date).catch(() => new Map()),
+        this.client.dailyRollUp('active-zone-minutes', date, date).catch(() => undefined),
+        this.restingHrNear(date),
+        this.profileAge(),
+        this.heartRateCoverageByDay(date, date),
+      ]);
+    const hr = coverage?.get(date);
 
     const levels = activity.get(date) ?? {};
     const distanceMm = num(pickRollup(distance[0], 'millimetersSum'));
@@ -450,7 +492,12 @@ export class GoogleHealthProvider implements HealthProvider {
         fairlyActiveMinutes: levels.MODERATELY_ACTIVE,
         veryActiveMinutes: levels.VERY_ACTIVE,
         restingHeartRate: rhr.onDate,
-        heartRateZones: heartRateZonesOf(azm[0], fitbitZones(age, rhr.latest)?.zones),
+        heartRateZones: heartRateZonesOf(
+          azmBucket(azm, date, hr),
+          fitbitZones(age, rhr.latest)?.zones,
+          hr?.withData,
+        ),
+        minutesWithoutHeartRate: hr?.withoutData,
       },
     };
   }
@@ -513,25 +560,29 @@ export class GoogleHealthProvider implements HealthProvider {
     // Zone minutes cost one rollup call; ranges longer than AZM_RANGE_DAYS get
     // zone bounds without minutes (the tool description says the same).
     const days = (Date.parse(end) - Date.parse(start)) / 86_400_000 + 1;
-    const [rows, age, azm] = await Promise.all([
+    const withMinutes = days <= AZM_RANGE_DAYS;
+    const [rows, age, azm, coverage] = await Promise.all([
       this.listPayloads('daily-resting-heart-rate', 'daily', start, end),
       this.profileAge(),
-      days <= AZM_RANGE_DAYS
-        ? this.client.dailyRollUp('active-zone-minutes', start, end).catch(() => [])
-        : Promise.resolve([]),
+      withMinutes
+        ? this.client.dailyRollUp('active-zone-minutes', start, end).catch(() => undefined)
+        : Promise.resolve(undefined),
+      withMinutes ? this.heartRateCoverageByDay(start, end) : Promise.resolve(undefined),
     ]);
-    const azmByDate = new Map(azm.map((b) => [rollupDate(b), b]));
     return rows.map((r) => {
       const dateTime = fromCivilDate(r.date) ?? start;
       const restingHr = num(r.beatsPerMinute);
+      const hr = coverage?.get(dateTime);
       return {
         dateTime,
         value: {
           restingHeartRate: restingHr,
           heartRateZones: heartRateZonesOf(
-            azmByDate.get(dateTime),
+            azmBucket(azm, dateTime, hr),
             fitbitZones(age, restingHr)?.zones,
+            hr?.withData,
           ),
+          minutesWithoutHeartRate: hr?.withoutData,
         },
       };
     });
@@ -558,14 +609,16 @@ export class GoogleHealthProvider implements HealthProvider {
     const fetchEnd = Math.min(to, Date.now());
     const offset = zoneOffsetMs(new Date(from), tz);
 
-    const [samples, rhr, azm, age] = await Promise.all([
+    const [samples, rhr, azm, age, coverage] = await Promise.all([
       fetchEnd > from
         ? this.heartRateSamples(from, fetchEnd, offset)
         : Promise.resolve([] as HrSample[]),
       this.restingHrNear(date),
-      this.client.dailyRollUp('active-zone-minutes', date, date).catch(() => []),
+      this.client.dailyRollUp('active-zone-minutes', date, date).catch(() => undefined),
       this.profileAge(),
+      this.heartRateCoverageByDay(date, date),
     ]);
+    const hr = coverage?.get(date);
     const restingHr = rhr.onDate;
     const fz = fitbitZones(age, rhr.latest);
 
@@ -575,7 +628,8 @@ export class GoogleHealthProvider implements HealthProvider {
       detailLevel,
       window: GoogleHealthProvider.window(from, to, tz),
       restingHeartRate: restingHr,
-      heartRateZones: heartRateZonesOf(azm[0], fz?.zones),
+      heartRateZones: heartRateZonesOf(azmBucket(azm, date, hr), fz?.zones, hr?.withData),
+      minutesWithoutHeartRate: hr?.withoutData,
       zoneBasis: fz?.basis,
       summary: summarize(samples),
       points: bucketize(samples, bucketSec),
@@ -693,20 +747,24 @@ export class GoogleHealthProvider implements HealthProvider {
     };
   }
 
-  async exportExerciseTcx(ref: ExerciseRef, opts: { partialData: boolean }): Promise<string> {
-    const id = ref.exerciseId
-      ? exerciseIdOf(ref.exerciseId)
-      : exerciseIdOf(String((await this.findExercise(ref)).name ?? ''));
+  async exportExerciseTcx(
+    ref: ExerciseRef,
+    opts: { partialData: boolean },
+  ): Promise<{ exerciseId: string; logId: number; tcx: string }> {
+    // Load the record even for an exerciseId: its resource name gives both ids.
+    const name = String((await this.findExercise(ref)).name ?? '');
+    const id = exerciseIdOf(name);
+    const ids = { exerciseId: id, logId: nameToNumericId(name) };
     const text = await this.client.requestText({
       path: `/users/me/dataTypes/exercise/dataPoints/${id}:exportExerciseTcx`,
       query: { alt: 'media', partialData: String(opts.partialData) },
       accept: 'application/vnd.garmin.tcx+xml, application/xml, application/json',
     });
     // Without alt=media the API wraps the file as {"tcxData": "..."}.
-    if (text.trimStart().startsWith('{')) {
-      return String((JSON.parse(text) as Row).tcxData ?? '');
-    }
-    return text;
+    const tcx = text.trimStart().startsWith('{')
+      ? String((JSON.parse(text) as Row).tcxData ?? '')
+      : text;
+    return { ...ids, tcx };
   }
 
   async getSleep(date: string): Promise<SleepLog[]> {
@@ -1262,7 +1320,7 @@ const GOOGLE_ZONE_FIELDS: Array<[field: string, name: string]> = [
 
 function readGoogleZones(
   durations: unknown,
-): Array<{ name: string; seconds: number; percent: number }> | undefined {
+): Array<{ name: string; seconds: number; minutes: number; percent: number }> | undefined {
   if (!durations || typeof durations !== 'object') return undefined;
   const d = durations as Row;
   const zones = GOOGLE_ZONE_FIELDS.map(([field, name]) => ({
@@ -1271,7 +1329,11 @@ function readGoogleZones(
   }));
   const total = zones.reduce((a, z) => a + z.seconds, 0);
   if (total === 0) return undefined;
-  return zones.map((z) => ({ ...z, percent: Math.round((z.seconds / total) * 1000) / 10 }));
+  return zones.map((z) => ({
+    ...z,
+    minutes: Math.round(z.seconds / 6) / 10,
+    percent: Math.round((z.seconds / total) * 1000) / 10,
+  }));
 }
 
 /** Pull a named field out of a rollup bucket, whatever nesting it arrives in. */
@@ -1314,32 +1376,68 @@ const AZM_ZONE_FIELDS: Array<[field: string, name: string]> = [
 ];
 
 /**
- * Zones for the `heartRateZones` field. Minutes come from the zone-minutes
- * rollup; the API has no zone bounds, so they come from `bounds` (computed).
- * Without bounds, only the zones that have minutes are listed, with no min/max.
+ * Zones for the `heartRateZones` field.
+ *
+ * Minutes for Fat Burn, Cardio and Peak come from the zone-minutes rollup
+ * (`azm`; a field that is absent there means 0). Google gives no minutes for
+ * Out of Range, so they are worked out as minutes with heart-rate data minus
+ * the other three zones. The API has no zone bounds, so they come from
+ * `bounds` (computed). `azm` undefined means the minutes are unknown.
  */
 function heartRateZonesOf(
   azm: Row | undefined,
   bounds: HrZone[] | undefined,
+  minutesWithData: number | undefined,
 ): HeartRateZone[] | undefined {
-  const minutesOf = (name: string): number | undefined => {
-    const field = AZM_ZONE_FIELDS.find(([, n]) => n === name)?.[0];
-    return field && azm ? num(pickRollup(azm, field)) : undefined;
+  const google = new Map(
+    AZM_ZONE_FIELDS.map(([field, name]) => [
+      name,
+      azm ? (num(pickRollup(azm, field)) ?? 0) : undefined,
+    ]),
+  );
+  const googleSum = azm
+    ? [...google.values()].reduce<number>((a, b) => a + (b ?? 0), 0)
+    : undefined;
+  const outOfRange =
+    googleSum === undefined || minutesWithData === undefined
+      ? undefined
+      : Math.max(0, minutesWithData - googleSum);
+  const minutesOf = (name: string) => {
+    if (name === OUT_OF_RANGE) {
+      return outOfRange === undefined ? {} : { minutes: outOfRange, minutesSource: 'computed' };
+    }
+    const minutes = google.get(name);
+    return minutes === undefined ? {} : { minutes, minutesSource: 'google' };
   };
   if (bounds) {
     return bounds.map((z) => ({
       name: z.name,
-      min: z.minBpm,
-      max: z.maxBpm,
-      minutes: minutesOf(z.name),
+      min: z.min,
+      max: z.max,
+      ...minutesOf(z.name),
       source: 'computed',
     }));
   }
-  const zones = AZM_ZONE_FIELDS.flatMap(([, name]) => {
-    const minutes = minutesOf(name);
-    return minutes === undefined ? [] : [{ name, minutes }];
-  });
+  const zones = [OUT_OF_RANGE, ...AZM_ZONE_FIELDS.map(([, name]) => name)]
+    .map((name) => ({ name, ...minutesOf(name) }))
+    .filter((z) => z.minutes !== undefined);
   return zones.length ? zones : undefined;
+}
+
+const OUT_OF_RANGE = 'Out of Range';
+
+/**
+ * The zone-minutes bucket of one date. Google skips a day with no zone
+ * minutes, so a missing bucket on a day with heart-rate data means 0 minutes.
+ * Undefined when the rollup failed or the day has no heart-rate data.
+ */
+function azmBucket(
+  azm: Row[] | undefined,
+  date: string,
+  hr: { withData: number } | undefined,
+): Row | undefined {
+  if (!azm) return undefined;
+  return azm.find((b) => rollupDate(b) === date) ?? (hr && hr.withData > 0 ? {} : undefined);
 }
 
 /** Zone minutes are fetched only for heart-rate ranges up to this many days. */

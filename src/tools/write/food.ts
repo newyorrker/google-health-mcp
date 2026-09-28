@@ -11,12 +11,13 @@ import {
   NutritionalValuesSchema,
   WaterLogEntrySchema,
 } from '../../providers/types';
+import { DAILY_SUMMARY_CACHE } from '../read/activity';
 
 async function invalidateFoodCaches(env: Env, date: string): Promise<void> {
   await invalidate(
     env,
     cacheKey('get_food_log', { date }),
-    cacheKey('get_daily_summary', { date }),
+    cacheKey(DAILY_SUMMARY_CACHE, { date }),
   );
 }
 

@@ -111,18 +111,18 @@ describe('sliceByTime', () => {
 describe('zones', () => {
   it('builds Bevel percent-of-max zones', () => {
     const z = percentMaxZones(187);
-    expect(z.map((x) => x.minBpm)).toEqual([0, 94, 112, 131, 150, 168]);
-    expect(z[5]?.maxBpm).toBeUndefined();
+    expect(z.map((x) => x.min)).toEqual([0, 94, 112, 131, 150, 168]);
+    expect(z[5]?.max).toBe(187);
   });
 
-  it('builds Fitbit Karvonen zones with real outer bounds', () => {
+  it('builds Fitbit Karvonen zones that end at max heart rate', () => {
     // Max 187 (220 - 33), resting 59: reserve 128 -> 110 / 136 / 168 bpm.
     const z = karvonenZones(187, 59);
-    expect(z.map((x) => [x.name, x.minBpm, x.maxBpm])).toEqual([
+    expect(z.map((x) => [x.name, x.min, x.max])).toEqual([
       ['Out of Range', 30, 109],
       ['Fat Burn', 110, 135],
       ['Cardio', 136, 167],
-      ['Peak', 168, 220],
+      ['Peak', 168, 187],
     ]);
   });
 

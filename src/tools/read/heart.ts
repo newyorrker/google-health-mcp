@@ -15,7 +15,7 @@ import { HeartRateDaySchema, HrResolutionSchema, IntradayDetailLevel } from '../
 
 const FieldsSchema = z
   .enum(['full', 'compact'])
-  .optional()
+  .default('full')
   .describe(
     'full (default): points as {time_utc, time_local, bpm, ...}. compact: points as [time_local, bpm] without offset; the UTC offset is given once as utcOffset. About 4 times smaller.',
   );
@@ -31,7 +31,8 @@ export function registerHeartReadTools(
       title: 'Heart rate across a date range',
       description:
         'Daily resting heart rate and heart-rate zones for each day in the range. ' +
-        'Zone bounds (min/max bpm) are computed with the Fitbit Karvonen method from 220 - age and that day resting heart rate (source: computed); minutes come from Google zone minutes (up to 14-day ranges). ' +
+        'Each zone is {name, min, max, minutes, source, minutesSource}. Bounds (bpm) are computed with the Fitbit Karvonen method from 220 - age and that day resting heart rate (source: computed); Peak ends at max heart rate. ' +
+        'Minutes (up to 14-day ranges): Fat Burn, Cardio and Peak from Google zone minutes (minutesSource: google); Out of Range = minutes with heart-rate data minus the other zones (minutesSource: computed). minutesWithoutHeartRate = minutes of the day with no data. ' +
         'Past days are cached 1h, today 5 min.',
       inputSchema: {
         start: z.string().describe('YYYY-MM-DD'),
@@ -44,7 +45,7 @@ export function registerHeartReadTools(
         const range = normalizeRange(start, end);
         const days = await getCached(
           env,
-          cacheKey('get_heart_rate_range', range),
+          cacheKey('get_heart_rate_range.v2', range),
           () => provider.getHeartRateRange(range.start, range.end),
           { ttlSec: cacheTtlForDate(range.end) },
         );
@@ -64,11 +65,11 @@ export function registerHeartReadTools(
       title: 'Intraday heart rate for one day',
       description:
         'Heart-rate series for one local day, 00:00 to 24:00 in the user timezone, or a part of it with start_time/end_time. Every point has time_utc and time_local (ISO 8601 with offset). ' +
-        'Real sampling: the device stores raw points about every 1-5 s during a workout and less often at rest. ' +
+        'Real sampling: raw points come about every 1-5 s, about every 2 s during a workout. ' +
         '1sec returns these raw points as they are and adds no extra precision; 1min/5min/15min return per-bucket avg (bpm), min, max and sample count. ' +
         'WARNING: 1sec for a full day is about 35k points (about 3 MB) and does not fit in a model context. Use 1min for day views, or narrow the window with start_time/end_time and fields=compact. ' +
         'To analyse a workout, use get_exercise_heart_rate (series, summary and time in zones in one call). For any other window use get_heart_rate_range_intraday. ' +
-        'heartRateZones has computed bounds (Fitbit Karvonen) and Google zone minutes. Past days are cached 1h, today 5 min.',
+        'heartRateZones: {name, min, max, minutes, source, minutesSource} for the whole day. Bounds are computed (Fitbit Karvonen, Peak ends at max heart rate). Minutes for Fat Burn, Cardio and Peak come from Google; Out of Range minutes are computed as minutes with heart-rate data minus the other zones. minutesWithoutHeartRate = minutes of the day with no data; all zone minutes plus it add up to the day length (for today: the minutes so far). Past days are cached 1h, today 5 min.',
       inputSchema: {
         date: z.string().describe('YYYY-MM-DD, a local date in the user timezone.'),
         detailLevel: IntradayDetailLevel.describe(
@@ -76,11 +77,11 @@ export function registerHeartReadTools(
         ),
         start_time: z
           .string()
-          .optional()
+          .default('00:00')
           .describe('HH:MM local time. Start of the window inside the day. Default 00:00.'),
         end_time: z
           .string()
-          .optional()
+          .default('24:00')
           .describe(
             'HH:MM local time, 24:00 allowed. End of the window (exclusive). Default 24:00.',
           ),
@@ -93,7 +94,7 @@ export function registerHeartReadTools(
         const window = { startTime: start_time, endTime: end_time };
         const data = await getCached(
           env,
-          cacheKey('get_heart_rate_intraday.v3', { date, detailLevel, start_time, end_time }),
+          cacheKey('get_heart_rate_intraday.v4', { date, detailLevel, start_time, end_time }),
           () => provider.getHeartRateIntraday(date, detailLevel, window),
           { ttlSec: cacheTtlForDate(date) },
         );
@@ -152,6 +153,7 @@ export function registerHeartReadTools(
         'a summary (avg, min, max, point count, median interval and longest gap between raw points), time in zones, pause/stop events and laps with a heart-rate summary each. ' +
         'timeInZones = minutes in the Fitbit zones (Out of Range, Fat Burn, Cardio, Peak), with the same computed bounds as heartRateZones in the other tools unless max_hr is passed: Karvonen from max heart rate (220 - age, or max_hr) and resting heart rate. ' +
         'zones.google = zone durations that Google stores for the workout (whole minutes); zones.bevel = zones by percent of max heart rate (Bevel default). ' +
+        'Zones in timeInZones and zones.bevel have min and max in bpm (Google gives no bounds for zones.google); the top zone (Peak, Zone 5) ends at max heart rate, and a sample above it still counts in the top zone. ' +
         'padding_minutes adds context before and after the workout to the series only; the summary and zones cover the workout itself.',
       inputSchema: {
         exerciseId: z.string().optional().describe('exerciseId from get_exercise_list.'),
@@ -185,7 +187,7 @@ export function registerHeartReadTools(
         const ref = { exerciseId, logId, date };
         const data = await getCached(
           env,
-          cacheKey('get_exercise_heart_rate.v2', { ...ref, ...opts }),
+          cacheKey('get_exercise_heart_rate.v3', { ...ref, ...opts }),
           () => getExerciseHr(ref, opts),
           { ttlSec: date ? cacheTtlForDate(date) : 300 },
         );

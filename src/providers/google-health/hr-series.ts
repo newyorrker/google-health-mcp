@@ -36,7 +36,8 @@ export type HrSummary = {
   maxGapSec?: number;
 };
 
-export type HrZone = { name: string; minBpm: number; maxBpm?: number };
+/** A zone in bpm. `max` is inclusive; the top zone ends at max heart rate. */
+export type HrZone = { name: string; min: number; max: number };
 export type HrZoneTime = HrZone & { seconds: number; minutes: number; percent: number };
 
 /** Output resolution names mapped to bucket width in seconds. 0 = raw. */
@@ -241,17 +242,18 @@ export function sliceByTime(samples: HrSample[], from: number, to: number): HrSa
 
 /**
  * Zones as percent of maximum heart rate, the default method in the Bevel app:
- * restorative < 50 %, then zones 1–5 at 50/60/70/80/90 %.
+ * restorative < 50 %, then zones 1–5 at 50/60/70/80/90 %. Zone 5 ends at max
+ * heart rate, like Peak in the Karvonen zones.
  */
 export function percentMaxZones(maxHr: number): HrZone[] {
   const at = (p: number) => Math.round(maxHr * p);
   return [
-    { name: 'Restorative', minBpm: 0, maxBpm: at(0.5) - 1 },
-    { name: 'Zone 1', minBpm: at(0.5), maxBpm: at(0.6) - 1 },
-    { name: 'Zone 2', minBpm: at(0.6), maxBpm: at(0.7) - 1 },
-    { name: 'Zone 3', minBpm: at(0.7), maxBpm: at(0.8) - 1 },
-    { name: 'Zone 4', minBpm: at(0.8), maxBpm: at(0.9) - 1 },
-    { name: 'Zone 5', minBpm: at(0.9) },
+    { name: 'Restorative', min: 0, max: at(0.5) - 1 },
+    { name: 'Zone 1', min: at(0.5), max: at(0.6) - 1 },
+    { name: 'Zone 2', min: at(0.6), max: at(0.7) - 1 },
+    { name: 'Zone 3', min: at(0.7), max: at(0.8) - 1 },
+    { name: 'Zone 4', min: at(0.8), max: at(0.9) - 1 },
+    { name: 'Zone 5', min: at(0.9), max: maxHr },
   ];
 }
 
@@ -260,16 +262,16 @@ export function percentMaxZones(maxHr: number): HrZone[] {
  * reserve, where reserve = max - resting): Fat Burn from 40 %, Cardio from
  * 60 %, Peak from 85 %. Out of Range is everything below Fat Burn.
  *
- * The outer bounds 30 and 220 bpm follow the old Fitbit Web API, so every
- * zone has a real min and max. Peak goes above 220 when max heart rate does.
+ * Out of Range starts at 30 bpm, like in the old Fitbit Web API, and Peak
+ * ends at max heart rate. A sample above max heart rate still counts as Peak.
  */
 export function karvonenZones(maxHr: number, restingHr: number): HrZone[] {
   const at = (p: number) => Math.round(restingHr + (maxHr - restingHr) * p);
   return [
-    { name: 'Out of Range', minBpm: 30, maxBpm: at(0.4) - 1 },
-    { name: 'Fat Burn', minBpm: at(0.4), maxBpm: at(0.6) - 1 },
-    { name: 'Cardio', minBpm: at(0.6), maxBpm: at(0.85) - 1 },
-    { name: 'Peak', minBpm: at(0.85), maxBpm: Math.max(220, maxHr) },
+    { name: 'Out of Range', min: 30, max: at(0.4) - 1 },
+    { name: 'Fat Burn', min: at(0.4), max: at(0.6) - 1 },
+    { name: 'Cardio', min: at(0.6), max: at(0.85) - 1 },
+    { name: 'Peak', min: at(0.85), max: maxHr },
   ];
 }
 
@@ -287,7 +289,7 @@ export function timeInZones(samples: HrSample[], zones: HrZone[], endMs: number)
     const next = i + 1 < samples.length ? (samples[i + 1] as HrSample).t : endMs;
     const dt = Math.min(Math.max(next - s.t, 0), MAX_GAP_MS) / 1000;
     let z = zones.length - 1;
-    while (z > 0 && s.bpm < (zones[z] as HrZone).minBpm) z--;
+    while (z > 0 && s.bpm < (zones[z] as HrZone).min) z--;
     secs[z] = (secs[z] as number) + dt;
   }
   const total = secs.reduce((a, b) => a + b, 0);

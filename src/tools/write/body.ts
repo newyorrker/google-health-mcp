@@ -6,6 +6,7 @@ import { assertIsoDate, today } from '../../lib/date';
 import { toolErrorResult } from '../../lib/errors';
 import type { HealthProvider } from '../../providers/types';
 import { BodyFatLogSchema, WeightLogSchema } from '../../providers/types';
+import { DAILY_SUMMARY_CACHE } from '../read/activity';
 
 const TIME_RE = /^\d{2}:\d{2}(:\d{2})?$/;
 
@@ -35,7 +36,7 @@ export function registerBodyWriteTools(
         const d = date ?? today();
         assertIsoDate(d, 'date');
         const entry = await provider.logWeight({ date: d, weightKg, time });
-        await invalidate(env, cacheKey('get_daily_summary', { date: d }));
+        await invalidate(env, cacheKey(DAILY_SUMMARY_CACHE, { date: d }));
         return {
           structuredContent: entry,
           content: [{ type: 'text', text: JSON.stringify(entry, null, 2) }],
@@ -97,7 +98,7 @@ export function registerBodyWriteTools(
         await provider.deleteWeightLog(logId);
         const d = date ?? today();
         assertIsoDate(d, 'date');
-        await invalidate(env, cacheKey('get_daily_summary', { date: d }));
+        await invalidate(env, cacheKey(DAILY_SUMMARY_CACHE, { date: d }));
         return {
           structuredContent: { deleted: true, logId },
           content: [{ type: 'text', text: `Deleted weight log ${logId}.` }],

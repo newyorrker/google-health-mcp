@@ -185,11 +185,13 @@ export class GoogleHealthClient {
     startTimeIso: string,
     endTimeIso: string,
     windowSize: string,
+    fields?: string,
   ): Promise<Array<Record<string, unknown>>> {
-    return this.postRollUp(`/users/me/dataTypes/${dataType}/dataPoints:rollUp`, {
-      range: { startTime: startTimeIso, endTime: endTimeIso },
-      windowSize,
-    });
+    return this.postRollUp(
+      `/users/me/dataTypes/${dataType}/dataPoints:rollUp`,
+      { range: { startTime: startTimeIso, endTime: endTimeIso }, windowSize },
+      fields,
+    );
   }
 
   /**
@@ -199,6 +201,7 @@ export class GoogleHealthClient {
   private async postRollUp(
     path: string,
     body: Record<string, unknown>,
+    fields?: string,
   ): Promise<Array<Record<string, unknown>>> {
     const out: Array<Record<string, unknown>> = [];
     let pageToken: string | undefined;
@@ -207,6 +210,7 @@ export class GoogleHealthClient {
       const text = await this.requestText({
         path,
         method: 'POST',
+        query: fields ? { fields } : undefined,
         json: pageToken ? { ...body, pageToken } : body,
       });
       const parsed = JSON.parse(text) as {
@@ -214,10 +218,11 @@ export class GoogleHealthClient {
         nextPageToken?: string;
       };
       out.push(...(parsed.rollupDataPoints ?? []));
-      if (!parsed.nextPageToken) break;
+      if (!parsed.nextPageToken) return out;
       pageToken = parsed.nextPageToken;
     }
-    return out;
+    // Partial data would look like real data (for example, too few minutes).
+    throw new Error(`Rollup ${path} has more than ${MAX_PAGES} pages.`);
   }
 }
 
