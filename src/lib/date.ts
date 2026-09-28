@@ -143,6 +143,29 @@ export function parseZonedIso(value: string, field: string): number {
   return ms;
 }
 
+/**
+ * Local wall-clock time `HH:MM` on `date` in `timeZone`, as epoch ms.
+ * `24:00` means the start of the next day. The second offset lookup makes
+ * the result right on days when the zone changes its offset (DST).
+ */
+export function localTimeToUtcMs(
+  date: string,
+  hhmm: string,
+  timeZone: string,
+  field: string,
+): number {
+  const m = /^(\d{2}):(\d{2})$/.exec(hhmm);
+  const h = Number(m?.[1]);
+  const min = Number(m?.[2]);
+  if (!m || min > 59 || h > 24 || (h === 24 && min !== 0)) {
+    throw new RangeError(`${field} must be HH:MM (00:00 to 24:00), got "${hhmm}".`);
+  }
+  const [y, mo, d] = date.split('-').map(Number) as [number, number, number];
+  const wall = Date.UTC(y, mo - 1, d, h, min);
+  const guess = wall - zoneOffsetMs(new Date(wall), timeZone);
+  return wall - zoneOffsetMs(new Date(guess), timeZone);
+}
+
 /** Cache lifetime: 5 minutes while the day is still open, 1 hour for past days. */
 export function cacheTtlForDate(date: string, timeZone?: string): number {
   return date >= today(timeZone) ? 300 : 3600;

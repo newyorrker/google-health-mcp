@@ -4,6 +4,7 @@ import {
   type HrSample,
   isoLocal,
   isoUtc,
+  karvonenZones,
   medianIntervalSec,
   offsetSuffix,
   parseHrRows,
@@ -91,6 +92,7 @@ describe('summarize', () => {
       max: 150,
       pointCount: 4,
       medianIntervalSec: 3,
+      maxGapSec: 64,
     });
   });
 
@@ -113,6 +115,17 @@ describe('zones', () => {
     expect(z[5]?.maxBpm).toBeUndefined();
   });
 
+  it('builds Fitbit Karvonen zones with real outer bounds', () => {
+    // Max 187 (220 - 33), resting 59: reserve 128 -> 110 / 136 / 168 bpm.
+    const z = karvonenZones(187, 59);
+    expect(z.map((x) => [x.name, x.minBpm, x.maxBpm])).toEqual([
+      ['Out of Range', 30, 109],
+      ['Fat Burn', 110, 135],
+      ['Cardio', 136, 167],
+      ['Peak', 168, 220],
+    ]);
+  });
+
   it('weights time by the gap to the next sample and caps long gaps', () => {
     const zones = percentMaxZones(200); // Zone 1 from 100, Zone 2 from 120, Zone 4 from 160
     const t = timeInZones(samples, zones, T0 + 71_000);
@@ -122,5 +135,6 @@ describe('zones', () => {
     expect(byName['Zone 1']).toBe(6);
     expect(byName['Zone 2']).toBe(30);
     expect(byName['Zone 3']).toBe(1);
+    expect(t.find((x) => x.name === 'Zone 2')?.minutes).toBe(0.5);
   });
 });

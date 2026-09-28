@@ -32,10 +32,12 @@ export type HrSummary = {
   max?: number;
   pointCount: number;
   medianIntervalSec?: number;
+  /** Longest time between neighbouring samples, in seconds. */
+  maxGapSec?: number;
 };
 
 export type HrZone = { name: string; minBpm: number; maxBpm?: number };
-export type HrZoneTime = HrZone & { seconds: number; percent: number };
+export type HrZoneTime = HrZone & { seconds: number; minutes: number; percent: number };
 
 /** Output resolution names mapped to bucket width in seconds. 0 = raw. */
 export const RESOLUTION_SEC = { raw: 0, '5s': 5, '15s': 15, '1min': 60 } as const;
@@ -201,7 +203,19 @@ export function summarize(samples: HrSample[]): HrSummary {
     max,
     pointCount: samples.length,
     medianIntervalSec: medianIntervalSec(samples),
+    maxGapSec: maxGapSec(samples),
   };
+}
+
+/** Longest time between neighbouring samples, in seconds. */
+export function maxGapSec(samples: HrSample[]): number | undefined {
+  if (samples.length < 2) return undefined;
+  let max = 0;
+  for (let i = 1; i < samples.length; i++) {
+    const gap = (samples[i] as HrSample).t - (samples[i - 1] as HrSample).t;
+    if (gap > max) max = gap;
+  }
+  return Math.round(max / 100) / 10;
 }
 
 /** Median time between neighbouring samples, in seconds. */
@@ -242,6 +256,24 @@ export function percentMaxZones(maxHr: number): HrZone[] {
 }
 
 /**
+ * Fitbit heart-rate zones by the Karvonen method (percent of heart-rate
+ * reserve, where reserve = max - resting): Fat Burn from 40 %, Cardio from
+ * 60 %, Peak from 85 %. Out of Range is everything below Fat Burn.
+ *
+ * The outer bounds 30 and 220 bpm follow the old Fitbit Web API, so every
+ * zone has a real min and max. Peak goes above 220 when max heart rate does.
+ */
+export function karvonenZones(maxHr: number, restingHr: number): HrZone[] {
+  const at = (p: number) => Math.round(restingHr + (maxHr - restingHr) * p);
+  return [
+    { name: 'Out of Range', minBpm: 30, maxBpm: at(0.4) - 1 },
+    { name: 'Fat Burn', minBpm: at(0.4), maxBpm: at(0.6) - 1 },
+    { name: 'Cardio', minBpm: at(0.6), maxBpm: at(0.85) - 1 },
+    { name: 'Peak', minBpm: at(0.85), maxBpm: Math.max(220, maxHr) },
+  ];
+}
+
+/**
  * Seconds spent in each zone.
  *
  * Each sample holds until the next one, so time is weighted by the real gap
@@ -262,6 +294,7 @@ export function timeInZones(samples: HrSample[], zones: HrZone[], endMs: number)
   return zones.map((zone, i) => ({
     ...zone,
     seconds: Math.round(secs[i] as number),
+    minutes: Math.round((secs[i] as number) / 6) / 10,
     percent: total > 0 ? Math.round(((secs[i] as number) / total) * 1000) / 10 : 0,
   }));
 }

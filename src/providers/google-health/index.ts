@@ -2,6 +2,7 @@ import type { Env } from '../../env';
 import { getCached } from '../../lib/cache';
 import {
   localDayStartUtc,
+  localTimeToUtcMs,
   parseZonedIso,
   today,
   toLocalDateString,
@@ -29,6 +30,7 @@ import type {
   HrResolutionT,
   HrvDay,
   IntradayDetailLevelT,
+  IntradayWindow,
   LogActivityInput,
   LogBodyFatInput,
   LogFoodInput,
@@ -45,6 +47,7 @@ import type {
   TimeWindow,
   WaterLogEntry,
   WeightLog,
+  ZoneBasis,
 } from '../types';
 import { addDays, GoogleHealthClient, maxPageSize, rollupRangeCapDays } from './client';
 import { dayRangeFilter, filterPath, type TimeField } from './filters';
@@ -52,8 +55,10 @@ import {
   bucketize,
   HR_FIELDS,
   type HrSample,
+  type HrZone,
   isoLocal,
   isoUtc,
+  karvonenZones,
   parseHrRows,
   percentMaxZones,
   RESOLUTION_SEC,
@@ -244,6 +249,50 @@ export class GoogleHealthProvider implements HealthProvider {
     }
   }
 
+  /** Age from the Google profile, cached for a day. Undefined when not readable. */
+  private async profileAge(): Promise<number | undefined> {
+    try {
+      return await getCached(
+        this.env,
+        'google_profile_age',
+        async () => {
+          const text = await this.client.requestText({ path: '/users/me/profile' });
+          const age = num((JSON.parse(text) as Row).age);
+          // Throwing keeps a missing age out of the cache.
+          if (age === undefined) throw new Error('profile has no age');
+          return age;
+        },
+        { ttlSec: 86_400 },
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Resting heart rate around a date: `onDate` is that date's own value, and
+   * `latest` is the newest value in the week up to it (for zone bounds, so a
+   * day without a resting value still gets zones).
+   */
+  private async restingHrNear(date: string): Promise<{ onDate?: number; latest?: number }> {
+    const rows = await this.listPayloads(
+      'daily-resting-heart-rate',
+      'daily',
+      addDays(date, -7),
+      date,
+    ).catch(() => [] as Row[]);
+    let best: { date: string; bpm: number } | undefined;
+    let onDate: number | undefined;
+    for (const r of rows) {
+      const d = fromCivilDate(r.date);
+      const bpm = num(r.beatsPerMinute);
+      if (!d || bpm === undefined) continue;
+      if (d === date) onDate = bpm;
+      if (!best || d > best.date) best = { date: d, bpm };
+    }
+    return { onDate, latest: best?.bpm };
+  }
+
   /**
    * Raw heart-rate samples in `[startMs, endMs)`, oldest first.
    *
@@ -373,14 +422,15 @@ export class GoogleHealthProvider implements HealthProvider {
     // Fitbit served this from one endpoint; Google needs one rollup per
     // metric. They are independent, so fire them together and let a single
     // unavailable metric come back undefined rather than failing the summary.
-    const [steps, calories, distance, floors, activity, azm, rhr] = await Promise.all([
+    const [steps, calories, distance, floors, activity, azm, rhr, age] = await Promise.all([
       this.client.dailyRollUp('steps', date, date).catch(() => []),
       this.client.dailyRollUp('total-calories', date, date).catch(() => []),
       this.client.dailyRollUp('distance', date, date).catch(() => []),
       this.client.dailyRollUp('floors', date, date).catch(() => []),
       this.activityLevelMinutesByDay(date, date).catch(() => new Map()),
       this.client.dailyRollUp('active-zone-minutes', date, date).catch(() => []),
-      this.listPayloads('daily-resting-heart-rate', 'daily', date, date).catch(() => []),
+      this.restingHrNear(date),
+      this.profileAge(),
     ]);
 
     const levels = activity.get(date) ?? {};
@@ -399,8 +449,8 @@ export class GoogleHealthProvider implements HealthProvider {
         lightlyActiveMinutes: levels.LIGHTLY_ACTIVE,
         fairlyActiveMinutes: levels.MODERATELY_ACTIVE,
         veryActiveMinutes: levels.VERY_ACTIVE,
-        restingHeartRate: num((rhr[0] as Row | undefined)?.beatsPerMinute),
-        heartRateZones: readAzmZones(azm[0]),
+        restingHeartRate: rhr.onDate,
+        heartRateZones: heartRateZonesOf(azm[0], fitbitZones(age, rhr.latest)?.zones),
       },
     };
   }
@@ -460,43 +510,73 @@ export class GoogleHealthProvider implements HealthProvider {
   }
 
   async getHeartRateRange(start: string, end: string): Promise<HeartRateDay[]> {
-    const rows = await this.listPayloads('daily-resting-heart-rate', 'daily', start, end);
-    return rows.map((r) => ({
-      dateTime: fromCivilDate(r.date) ?? start,
-      value: { restingHeartRate: num(r.beatsPerMinute) },
-    }));
+    // Zone minutes cost one rollup call; ranges longer than AZM_RANGE_DAYS get
+    // zone bounds without minutes (the tool description says the same).
+    const days = (Date.parse(end) - Date.parse(start)) / 86_400_000 + 1;
+    const [rows, age, azm] = await Promise.all([
+      this.listPayloads('daily-resting-heart-rate', 'daily', start, end),
+      this.profileAge(),
+      days <= AZM_RANGE_DAYS
+        ? this.client.dailyRollUp('active-zone-minutes', start, end).catch(() => [])
+        : Promise.resolve([]),
+    ]);
+    const azmByDate = new Map(azm.map((b) => [rollupDate(b), b]));
+    return rows.map((r) => {
+      const dateTime = fromCivilDate(r.date) ?? start;
+      const restingHr = num(r.beatsPerMinute);
+      return {
+        dateTime,
+        value: {
+          restingHeartRate: restingHr,
+          heartRateZones: heartRateZonesOf(
+            azmByDate.get(dateTime),
+            fitbitZones(age, restingHr)?.zones,
+          ),
+        },
+      };
+    });
   }
 
   async getHeartRateIntraday(
     date: string,
     detailLevel: IntradayDetailLevelT,
+    window: IntradayWindow = {},
   ): Promise<HeartRateIntraday> {
     // Google stores raw samples only, every 1-5 s during a workout and less
     // often at rest. 1sec returns them as they are; the other levels average
     // them into buckets here.
     const bucketSec = { '1sec': 0, '1min': 60, '5min': 300, '15min': 900 }[detailLevel];
     const tz = await this.userTimeZone();
-    const dayStart = localDayStartUtc(date, tz).getTime();
-    const dayEnd = localDayStartUtc(addDays(date, 1), tz).getTime();
+    const from = window.startTime
+      ? localTimeToUtcMs(date, window.startTime, tz, 'start_time')
+      : localDayStartUtc(date, tz).getTime();
+    const to = window.endTime
+      ? localTimeToUtcMs(date, window.endTime, tz, 'end_time')
+      : localDayStartUtc(addDays(date, 1), tz).getTime();
+    if (to <= from) throw new RangeError('end_time must be later than start_time.');
     // No point asking for the future part of today.
-    const fetchEnd = Math.min(dayEnd, Date.now());
-    const offset = zoneOffsetMs(new Date(dayStart), tz);
+    const fetchEnd = Math.min(to, Date.now());
+    const offset = zoneOffsetMs(new Date(from), tz);
 
-    const [samples, rhr, azm] = await Promise.all([
-      fetchEnd > dayStart
-        ? this.heartRateSamples(dayStart, fetchEnd, offset)
+    const [samples, rhr, azm, age] = await Promise.all([
+      fetchEnd > from
+        ? this.heartRateSamples(from, fetchEnd, offset)
         : Promise.resolve([] as HrSample[]),
-      this.listPayloads('daily-resting-heart-rate', 'daily', date, date).catch(() => []),
+      this.restingHrNear(date),
       this.client.dailyRollUp('active-zone-minutes', date, date).catch(() => []),
+      this.profileAge(),
     ]);
+    const restingHr = rhr.onDate;
+    const fz = fitbitZones(age, rhr.latest);
 
     return {
       date,
       timeZone: tz,
       detailLevel,
-      window: GoogleHealthProvider.window(dayStart, dayEnd, tz),
-      restingHeartRate: num((rhr[0] as Row | undefined)?.beatsPerMinute),
-      heartRateZones: readAzmZones(azm[0]),
+      window: GoogleHealthProvider.window(from, to, tz),
+      restingHeartRate: restingHr,
+      heartRateZones: heartRateZonesOf(azm[0], fz?.zones),
+      zoneBasis: fz?.basis,
       summary: summarize(samples),
       points: bucketize(samples, bucketSec),
     };
@@ -511,9 +591,11 @@ export class GoogleHealthProvider implements HealthProvider {
     const endMs = parseZonedIso(end, 'end');
     assertSeriesWindow(startMs, endMs);
     const tz = await this.userTimeZone();
+    // The whole `end` second is included, the same way a workout keeps its
+    // stop second. So a window copied from a workout gives the same series.
     const samples = await this.heartRateSamples(
       startMs,
-      endMs,
+      Math.floor(endMs / 1000) * 1000 + 1000,
       zoneOffsetMs(new Date(startMs), tz),
     );
     return {
@@ -539,11 +621,11 @@ export class GoogleHealthProvider implements HealthProvider {
     const to = rec.endMs + pad + 1000;
     assertSeriesWindow(from, to);
 
-    const [samples, age] = await Promise.all([
+    const workoutDate = isoLocal(rec.startMs, rec.offMs).slice(0, 10);
+    const [samples, age, rhr] = await Promise.all([
       this.heartRateSamples(from, to, rec.offMs),
-      opts.maxHr
-        ? Promise.resolve(undefined)
-        : this.getJsonOrEmpty('/users/me/profile').then((p) => num(p.age)),
+      this.profileAge(),
+      this.restingHrNear(workoutDate),
     ]);
 
     // Statistics cover the session only; padding is for context in `points`.
@@ -551,16 +633,8 @@ export class GoogleHealthProvider implements HealthProvider {
     const e = rec.raw;
     const metrics = (e.metricsSummary ?? {}) as Row;
 
+    const fz = fitbitZones(age, rhr.latest, opts.maxHr);
     const maxHr = opts.maxHr ?? (age ? 220 - age : undefined);
-    const computed =
-      maxHr === undefined
-        ? undefined
-        : {
-            method: 'percent of max heart rate (Bevel default zones)',
-            maxHr,
-            maxHrSource: opts.maxHr ? 'max_hr input' : `220 - age (${age})`,
-            zones: timeInZones(session, percentMaxZones(maxHr), rec.endMs),
-          };
 
     const events = ((e.exerciseEvents as Row[] | undefined) ?? []).flatMap((ev) => {
       const t = Date.parse(ev.eventTime as string);
@@ -607,7 +681,12 @@ export class GoogleHealthProvider implements HealthProvider {
       resolution: opts.resolution,
       paddingMinutes: opts.paddingMinutes,
       summary: summarize(session),
-      zones: { google: readGoogleZones(metrics.heartRateZoneDurations), computed },
+      timeInZones: fz && { ...fz.basis, zones: timeInZones(session, fz.zones, rec.endMs) },
+      zones: {
+        google: readGoogleZones(metrics.heartRateZoneDurations),
+        bevel:
+          maxHr === undefined ? undefined : timeInZones(session, percentMaxZones(maxHr), rec.endMs),
+      },
       events,
       laps,
       points: bucketize(samples, RESOLUTION_SEC[opts.resolution]),
@@ -1234,17 +1313,66 @@ const AZM_ZONE_FIELDS: Array<[field: string, name: string]> = [
   ['sumInPeakHeartZone', 'Peak'],
 ];
 
-function readAzmZones(bucket: Row | undefined): HeartRateZone[] | undefined {
-  if (!bucket) return undefined;
-  const zones: HeartRateZone[] = [];
-  for (const [field, name] of AZM_ZONE_FIELDS) {
-    const minutes = num(pickRollup(bucket, field));
-    if (minutes !== undefined) {
-      // Bounds are not reported by this endpoint; only the minutes are real.
-      zones.push({ name, min: 0, max: 0, minutes });
-    }
+/**
+ * Zones for the `heartRateZones` field. Minutes come from the zone-minutes
+ * rollup; the API has no zone bounds, so they come from `bounds` (computed).
+ * Without bounds, only the zones that have minutes are listed, with no min/max.
+ */
+function heartRateZonesOf(
+  azm: Row | undefined,
+  bounds: HrZone[] | undefined,
+): HeartRateZone[] | undefined {
+  const minutesOf = (name: string): number | undefined => {
+    const field = AZM_ZONE_FIELDS.find(([, n]) => n === name)?.[0];
+    return field && azm ? num(pickRollup(azm, field)) : undefined;
+  };
+  if (bounds) {
+    return bounds.map((z) => ({
+      name: z.name,
+      min: z.minBpm,
+      max: z.maxBpm,
+      minutes: minutesOf(z.name),
+      source: 'computed',
+    }));
   }
+  const zones = AZM_ZONE_FIELDS.flatMap(([, name]) => {
+    const minutes = minutesOf(name);
+    return minutes === undefined ? [] : [{ name, minutes }];
+  });
   return zones.length ? zones : undefined;
+}
+
+/** Zone minutes are fetched only for heart-rate ranges up to this many days. */
+const AZM_RANGE_DAYS = 14;
+
+/** Smallest heart-rate reserve (max - resting) that gives usable zones. */
+const MIN_HR_RESERVE = 20;
+
+/**
+ * Fitbit zones for a user. Max heart rate is `maxHrInput` or 220 - age.
+ * Undefined when max or resting heart rate is unknown or too close.
+ */
+function fitbitZones(
+  age: number | undefined,
+  restingHr: number | undefined,
+  maxHrInput?: number,
+): { basis: ZoneBasis; zones: HrZone[] } | undefined {
+  const maxHr = maxHrInput ?? (age ? 220 - age : undefined);
+  // A reserve below MIN_HR_RESERVE gives zones only a few bpm wide; that means bad input.
+  if (maxHr === undefined || restingHr === undefined || maxHr - restingHr < MIN_HR_RESERVE) {
+    return undefined;
+  }
+  return {
+    basis: {
+      source: 'computed',
+      method:
+        'Fitbit, Karvonen: Fat Burn from 40 %, Cardio from 60 %, Peak from 85 % of heart-rate reserve (max - resting)',
+      maxHr,
+      maxHrSource: maxHrInput ? 'max_hr input' : `220 - age (${age})`,
+      restingHr,
+    },
+    zones: karvonenZones(maxHr, restingHr),
+  };
 }
 
 /** Seconds covered by one sleep stage segment. */

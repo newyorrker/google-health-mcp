@@ -42,10 +42,13 @@ export const DevicesResponseSchema = z.array(DeviceSchema);
 // ---------- Heart rate zones (shared by daily summary + HR endpoints) ----------
 export const HeartRateZoneSchema = z.object({
   name: z.string(),
-  min: z.number(),
-  max: z.number(),
+  /** Bounds in bpm. Absent when resting heart rate or age is unknown, never 0. */
+  min: z.number().optional(),
+  max: z.number().optional(),
   minutes: z.number().optional(),
   caloriesOut: z.number().optional(),
+  /** "computed" = bounds worked out here (Karvonen), not read from the API. */
+  source: z.string().optional(),
 });
 export type HeartRateZone = z.infer<typeof HeartRateZoneSchema>;
 
@@ -192,8 +195,19 @@ export const HeartRateSummarySchema = z.object({
   max: z.number().optional(),
   pointCount: z.number(),
   medianIntervalSec: z.number().optional(),
+  maxGapSec: z.number().optional(),
 });
 export type HeartRateSummary = z.infer<typeof HeartRateSummarySchema>;
+
+/** How zone bounds were worked out. The API does not report them. */
+export const ZoneBasisSchema = z.object({
+  source: z.literal('computed'),
+  method: z.string(),
+  maxHr: z.number(),
+  maxHrSource: z.string(),
+  restingHr: z.number(),
+});
+export type ZoneBasis = z.infer<typeof ZoneBasisSchema>;
 
 export const HeartRateIntradaySchema = z.object({
   date: z.string(),
@@ -202,10 +216,14 @@ export const HeartRateIntradaySchema = z.object({
   window: TimeWindowSchema.optional(),
   restingHeartRate: z.number().optional(),
   heartRateZones: z.array(HeartRateZoneSchema).optional(),
+  zoneBasis: ZoneBasisSchema.optional(),
   summary: HeartRateSummarySchema.optional(),
   points: z.array(HeartRatePointSchema),
 });
 export type HeartRateIntraday = z.infer<typeof HeartRateIntradaySchema>;
+
+/** Optional part of the day, as local HH:MM. `endTime` may be 24:00. */
+export type IntradayWindow = { startTime?: string; endTime?: string };
 
 export const HeartRateSeriesSchema = z.object({
   timeZone: z.string(),
@@ -221,6 +239,7 @@ export const ZoneTimeSchema = z.object({
   minBpm: z.number().optional(),
   maxBpm: z.number().optional(),
   seconds: z.number(),
+  minutes: z.number().optional(),
   percent: z.number().optional(),
 });
 
@@ -247,18 +266,13 @@ export const ExerciseHeartRateSchema = z.object({
   paddingMinutes: z.number(),
   /** Summary over the session only; padding is excluded. */
   summary: HeartRateSummarySchema,
+  /** Time in the user's Fitbit zones (Karvonen bounds), same bounds as heartRateZones elsewhere. */
+  timeInZones: ZoneBasisSchema.extend({ zones: z.array(ZoneTimeSchema) }).optional(),
   zones: z.object({
-    /** Zone durations reported by Google for this workout. */
+    /** Zone durations reported by Google for this workout (whole minutes). */
     google: z.array(ZoneTimeSchema).optional(),
     /** Zones as % of max heart rate (Bevel default method), computed here. */
-    computed: z
-      .object({
-        method: z.string(),
-        maxHr: z.number(),
-        maxHrSource: z.string(),
-        zones: z.array(ZoneTimeSchema),
-      })
-      .optional(),
+    bevel: z.array(ZoneTimeSchema).optional(),
   }),
   events: z.array(ExerciseEventSchema),
   laps: z.array(ExerciseLapSchema),
@@ -533,7 +547,11 @@ export interface HealthProvider {
   ): Promise<TimeSeries>;
   getExerciseList(opts: ExerciseListOptions): Promise<ExerciseLog[]>;
   getHeartRateRange(start: string, end: string): Promise<HeartRateDay[]>;
-  getHeartRateIntraday(date: string, detailLevel: IntradayDetailLevelT): Promise<HeartRateIntraday>;
+  getHeartRateIntraday(
+    date: string,
+    detailLevel: IntradayDetailLevelT,
+    window?: IntradayWindow,
+  ): Promise<HeartRateIntraday>;
   getSleep(date: string): Promise<SleepLog[]>;
   getSleepRange(start: string, end: string): Promise<SleepLog[]>;
   getBodyLog(start: string, end: string): Promise<BodyLog>;

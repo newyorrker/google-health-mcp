@@ -223,11 +223,11 @@ hour; if it returns 401, call any tool through Claude once so the Worker refresh
 | `list_devices` | — | Paired devices, battery, last sync |
 | `get_daily_summary` | `date?` | Steps, calories, distance, active minutes, resting HR |
 | `get_activity_timeseries` | `resource, start, end` | steps / distance / calories / floors / active-minute levels |
-| `get_exercise_list` | `from?, to?, beforeDate?, limit?, min_duration_seconds?, include_short?` | Workout sessions with UTC and local times, active duration, GPS and lap flags. Records shorter than 60 s are hidden by default |
-| `get_heart_rate_range` | `start, end` | Daily resting heart rate |
-| `get_heart_rate_intraday` | `date, detailLevel` | One local day, 00:00–24:00 in the profile timezone. `1sec` returns every raw sample (about one every 2–5 s) |
-| `get_heart_rate_range_intraday` | `start, end, resolution?` | Any window up to 24 h. `start`/`end` need an offset (`+05:00` or `Z`). Resolution `raw`, `5s`, `15s`, `1min`; buckets carry avg, min and max |
-| `get_exercise_heart_rate` | `exerciseId? \| logId + date?, resolution?, padding_minutes?, max_hr?` | Heart rate of one workout: series, summary, zones, events, laps |
+| `get_exercise_list` | `from?, to?, beforeDate?, limit?, min_duration_seconds?` | Workout sessions with UTC and local times, active duration, GPS and lap flags. Records shorter than `min_duration_seconds` (default 60) are hidden; with `0`, records under 60 s come back with `suspected_accidental: true` |
+| `get_heart_rate_range` | `start, end` | Daily resting heart rate and heart-rate zones with bounds |
+| `get_heart_rate_intraday` | `date, detailLevel, start_time?, end_time?, fields?` | One local day, 00:00–24:00 in the profile timezone, or a part of it (`HH:MM`). `1sec` returns every raw sample (about one every 2–5 s); a full day is about 3 MB, so narrow it or use `fields: compact` |
+| `get_heart_rate_range_intraday` | `start, end, resolution?, fields?` | Any window up to 24 h. `start`/`end` need an offset (`+05:00` or `Z`); `end` is inclusive to the second. Resolution `raw` (default), `5s`, `15s`, `1min`; buckets carry avg, min and max |
+| `get_exercise_heart_rate` | `exerciseId? \| logId + date?, resolution?, padding_minutes?, max_hr?, fields?` | Heart rate of one workout: series (default `5s`), summary with the longest gap, time in zones, events, laps |
 | `export_exercise_tcx` | `exerciseId? \| logId + date?, partial_data?, max_chars?` | Garmin TCX file of a workout. Needs the optional location scope, see below |
 | `get_sleep` | `date?` | Sessions with stage breakdown |
 | `get_sleep_range` | `start, end` | |
@@ -242,7 +242,9 @@ hour; if it returns 401, call any tool through Claude once so the Worker refresh
 ### Notes on heart-rate tools
 
 - **Every time comes as a pair:** `time_utc` (`…Z`) and `time_local` (wall clock with its offset). The timezone comes from the Google profile settings.
-- **Zones.** `get_exercise_heart_rate` returns two sets. `zones.google` holds the zone times that Google stores with the workout. `zones.computed` uses the Bevel default: percent of maximum heart rate (restorative < 50 %, zones 1–5 from 50/60/70/80/90 %). Maximum heart rate is `max_hr` if you pass it, else 220 − age from the profile. Time in zone is weighted by the gap to the next sample; a gap counts at most 30 s.
+- **Zone bounds are computed.** The API reports zone minutes but no bpm bounds. The server uses the Fitbit Karvonen method: Fat Burn from 40 %, Cardio from 60 %, Peak from 85 % of heart-rate reserve (max − resting). Max is `max_hr` if you pass it, else 220 − age from the profile; resting is the latest resting heart rate up to that day (7-day lookback; in `get_heart_rate_range`, that day's own value). If max − resting is below 20 bpm, the server gives no bounds. Such zones carry `source: "computed"`. On live data these bounds match the zone times Google stores with a workout to within about a minute.
+- **Zones in `get_exercise_heart_rate`.** `timeInZones` uses the bounds above. `zones.google` holds the zone times that Google stores with the workout (whole minutes). `zones.bevel` uses the Bevel default: percent of max heart rate (restorative < 50 %, zones 1–5 from 50/60/70/80/90 %). Time in zone is weighted by the gap to the next sample; a gap counts at most 30 s.
+- **`fields: compact`** sends points as `[time_local, bpm]` without the offset and gives the offset once as `utcOffset`. It is about 4 times smaller.
 - **Cache.** Past days are cached for 1 hour, today and later for 5 minutes.
 - **TCX needs one more scope.** Run `pnpm run setup:google -- --location` to add `googlehealth.location.readonly`, and add that scope on the Data Access page of your OAuth consent screen. Without it, `export_exercise_tcx` returns HTTP 403 with a hint.
 

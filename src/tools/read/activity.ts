@@ -13,6 +13,9 @@ import {
   TimeSeriesSchema,
 } from '../../providers/types';
 
+/** Records shorter than this are flagged as probably started by accident. */
+const ACCIDENTAL_SEC = 60;
+
 export function registerActivityReadTools(
   server: McpServer,
   provider: HealthProvider,
@@ -90,7 +93,7 @@ export function registerActivityReadTools(
       description:
         'Exercise / activity logs (runs, walks, workouts), newest first. Filter by local dates with from / to (inclusive; default: the last 90 days up to today). ' +
         'Each entry has exerciseId, startTime / endTime in UTC, startTime_local / endTime_local with offset, activeDurationSec, distance (km), calories, averageHeartRate, hasGps and hasLaps. ' +
-        'Records shorter than min_duration_seconds (default 60) are usually accidental starts; they are hidden and counted in hiddenShortCount, or returned with suspected_accidental = true when include_short is true. ' +
+        'Records shorter than min_duration_seconds (default 60) are usually accidental starts; they are hidden and counted in hiddenShortCount. With min_duration_seconds = 0 all records are returned, and records shorter than 60 s have suspected_accidental = true. ' +
         'Pass exerciseId to get_exercise_heart_rate or export_exercise_tcx. Past ranges are cached 1h, ranges that include today 5 min.',
       inputSchema: {
         from: z.string().optional().describe('YYYY-MM-DD, inclusive.'),
@@ -108,18 +111,16 @@ export function registerActivityReadTools(
           .int()
           .min(0)
           .optional()
-          .describe('Default 60. 0 disables the filter.'),
-        include_short: z
-          .boolean()
-          .optional()
-          .describe('true = keep short records and flag them. Default false.'),
+          .describe(
+            'Records shorter than this are hidden and counted in hiddenShortCount. Default 60. 0 returns all records; records shorter than 60 s are then flagged suspected_accidental=true.',
+          ),
       },
       outputSchema: {
         exercises: z.array(ExerciseLogSchema),
         hiddenShortCount: z.number(),
       },
     },
-    async ({ from, to, beforeDate, limit, min_duration_seconds, include_short }) => {
+    async ({ from, to, beforeDate, limit, min_duration_seconds }) => {
       try {
         const end = to ?? beforeDate ?? today();
         assertIsoDate(end, 'to');
@@ -137,12 +138,12 @@ export function registerActivityReadTools(
         for (const ex of all) {
           const sec =
             ex.activeDurationSec ?? (ex.duration === undefined ? undefined : ex.duration / 1000);
-          const short = minSec > 0 && sec !== undefined && sec < minSec;
-          if (short && !include_short) {
+          if (sec !== undefined && sec < minSec) {
             hiddenShortCount++;
             continue;
           }
-          exercises.push(short ? { ...ex, suspected_accidental: true } : ex);
+          const accidental = sec !== undefined && sec < ACCIDENTAL_SEC;
+          exercises.push(accidental ? { ...ex, suspected_accidental: true } : ex);
         }
         const data = { exercises: exercises.slice(0, limit ?? 20), hiddenShortCount };
         return {
