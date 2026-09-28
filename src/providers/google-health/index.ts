@@ -17,6 +17,7 @@ import type {
   DailySummary,
   Device,
   ExerciseHeartRate,
+  ExerciseHrOptions,
   ExerciseListOptions,
   ExerciseLog,
   ExerciseRef,
@@ -53,6 +54,7 @@ import { addDays, GoogleHealthClient, maxPageSize, rollupRangeCapDays } from './
 import { dayRangeFilter, filterPath, type TimeField } from './filters';
 import {
   bucketize,
+  customZones,
   HR_FIELDS,
   type HrSample,
   type HrZone,
@@ -79,6 +81,7 @@ import {
   pointTimestamp,
   SLEEP_STAGE_TO_LEVEL,
 } from './map';
+import { analyzeSegments, parsePlan, pausesFromEvents } from './segments';
 
 type Row = Record<string, unknown>;
 
@@ -663,8 +666,10 @@ export class GoogleHealthProvider implements HealthProvider {
 
   async getExerciseHeartRate(
     ref: ExerciseRef,
-    opts: { resolution: HrResolutionT; paddingMinutes: number; maxHr?: number },
+    opts: ExerciseHrOptions,
   ): Promise<ExerciseHeartRate> {
+    // Parse first, so a bad plan fails before any API call.
+    const steps = opts.plan === undefined ? undefined : parsePlan(opts.plan);
     const tz = await this.userTimeZone();
     const rec = readExercise(await this.findExercise(ref), zoneOffsetMs(new Date(), tz));
     if (!rec) throw new UnsupportedOperationError('This exercise has no valid start and end time.');
@@ -674,10 +679,12 @@ export class GoogleHealthProvider implements HealthProvider {
     const from = rec.startMs - pad;
     const to = rec.endMs + pad + 1000;
     assertSeriesWindow(from, to);
+    // HRR60 can need samples up to 70 s after the workout ends.
+    const fetchTo = steps ? Math.max(to, rec.endMs + 75_000) : to;
 
     const workoutDate = isoLocal(rec.startMs, rec.offMs).slice(0, 10);
     const [samples, age, rhr] = await Promise.all([
-      this.heartRateSamples(from, to, rec.offMs),
+      this.heartRateSamples(from, fetchTo, rec.offMs),
       this.profileAge(),
       this.restingHrNear(workoutDate),
     ]);
@@ -690,18 +697,33 @@ export class GoogleHealthProvider implements HealthProvider {
     const fz = fitbitZones(age, rhr.latest, opts.maxHr);
     const maxHr = opts.maxHr ?? (age ? 220 - age : undefined);
 
-    const events = ((e.exerciseEvents as Row[] | undefined) ?? []).flatMap((ev) => {
+    const rawEvents = ((e.exerciseEvents as Row[] | undefined) ?? []).flatMap((ev) => {
       const t = Date.parse(ev.eventTime as string);
       if (!Number.isFinite(t)) return [];
       const off = durationMs(ev.eventUtcOffset) ?? rec.offMs;
-      return [
-        {
-          type: String(ev.exerciseEventType ?? ''),
-          time_utc: isoUtc(t),
-          time_local: isoLocal(t, off),
-        },
-      ];
+      return [{ type: String(ev.exerciseEventType ?? ''), t, off }];
     });
+    const events = rawEvents.map((ev) => ({
+      type: ev.type,
+      time_utc: isoUtc(ev.t),
+      time_local: isoLocal(ev.t, ev.off),
+    }));
+
+    const workLabel = opts.workLabel ?? 'r';
+    const plan =
+      steps && opts.plan !== undefined
+        ? {
+            text: opts.plan,
+            workLabel,
+            ...analyzeSegments(samples, steps, {
+              startMs: rec.startMs,
+              endMs: rec.endMs,
+              offMs: rec.offMs,
+              pauses: pausesFromEvents(rawEvents),
+              workLabel,
+            }),
+          }
+        : undefined;
 
     const laps = ((e.splitSummaries as Row[] | undefined) ?? []).flatMap((sp, index) => {
       const a = Date.parse(sp.startTime as string);
@@ -740,10 +762,24 @@ export class GoogleHealthProvider implements HealthProvider {
         google: readGoogleZones(metrics.heartRateZoneDurations),
         bevel:
           maxHr === undefined ? undefined : timeInZones(session, percentMaxZones(maxHr), rec.endMs),
+        custom: opts.customZones
+          ? timeInZones(
+              session,
+              customZones(
+                opts.customZones,
+                maxHr ?? session.reduce((m, x) => Math.max(m, x.bpm), 0),
+              ),
+              rec.endMs,
+            )
+          : undefined,
       },
+      plan,
       events,
       laps,
-      points: bucketize(samples, RESOLUTION_SEC[opts.resolution]),
+      points:
+        opts.includePoints === false
+          ? []
+          : bucketize(sliceByTime(samples, from, to), RESOLUTION_SEC[opts.resolution]),
     };
   }
 

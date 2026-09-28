@@ -282,7 +282,43 @@ export const ExerciseHeartRateSchema = z.object({
     google: z.array(ZoneTimeSchema).optional(),
     /** Zones as % of max heart rate (Bevel default method), computed here. */
     bevel: z.array(ZoneTimeSchema).optional(),
+    /** Zones from the custom_zones input. */
+    custom: z.array(ZoneTimeSchema).optional(),
   }),
+  /** Heart rate per segment of the plan input. */
+  plan: z
+    .object({
+      text: z.string(),
+      workLabel: z.string(),
+      segments: z.array(
+        z.object({
+          index: z.number(),
+          label: z.string(),
+          set: z.number().optional(),
+          work: z.boolean(),
+          start_local: z.string(),
+          end_local: z.string(),
+          durationSec: z.number(),
+          cutShort: z.boolean().optional(),
+          peak: z.number().optional(),
+          avg: z.number().optional(),
+          min: z.number().optional(),
+          end: z.object({ time_local: z.string(), bpm: z.number() }).optional(),
+          pointCount: z.number(),
+        }),
+      ),
+      recovery: z
+        .object({
+          segmentIndex: z.number(),
+          atEnd: z.object({ time_local: z.string(), bpm: z.number() }).optional(),
+          after60s: z.object({ time_local: z.string(), bpm: z.number() }).optional(),
+          hrr60: z.number().optional(),
+        })
+        .optional(),
+      /** Workout time after the planned segments, in seconds. */
+      unplannedTailSec: z.number(),
+    })
+    .optional(),
   events: z.array(ExerciseEventSchema),
   laps: z.array(ExerciseLapSchema),
   points: z.array(HeartRatePointSchema),
@@ -300,6 +336,20 @@ export const ExerciseTcxSchema = z.object({
   tcx: z.string(),
 });
 export type ExerciseTcx = z.infer<typeof ExerciseTcxSchema>;
+
+export type ExerciseHrOptions = {
+  resolution: HrResolutionT;
+  paddingMinutes: number;
+  maxHr?: number;
+  /** Lower zone bounds from the user (e.g. their app); gives zones.custom. */
+  customZones?: Array<{ name?: string; min: number }>;
+  /** Workout plan such as `5w 3r [3r 3w]x4 8w`; gives `plan` with per-segment heart rate. */
+  plan?: string;
+  /** Segments with this label are work segments; HRR60 follows the last one. */
+  workLabel?: string;
+  /** False leaves `points` empty (useful with `plan`). */
+  includePoints?: boolean;
+};
 
 /** How a tool names one exercise: Google id, or the numeric logId plus an optional date hint. */
 export type ExerciseRef = { exerciseId?: string; logId?: number; date?: string };
@@ -577,10 +627,7 @@ export interface HealthProvider {
     end: string,
     resolution: HrResolutionT,
   ): Promise<HeartRateSeries>;
-  getExerciseHeartRate?(
-    ref: ExerciseRef,
-    opts: { resolution: HrResolutionT; paddingMinutes: number; maxHr?: number },
-  ): Promise<ExerciseHeartRate>;
+  getExerciseHeartRate?(ref: ExerciseRef, opts: ExerciseHrOptions): Promise<ExerciseHeartRate>;
   exportExerciseTcx?(
     ref: ExerciseRef,
     opts: { partialData: boolean },

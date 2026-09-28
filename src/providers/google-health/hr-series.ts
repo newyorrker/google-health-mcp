@@ -246,7 +246,9 @@ export function sliceByTime(samples: HrSample[], from: number, to: number): HrSa
  * heart rate, like Peak in the Karvonen zones.
  */
 export function percentMaxZones(maxHr: number): HrZone[] {
-  const at = (p: number) => Math.round(maxHr * p);
+  // Bevel rounds a bound up: max 188 gives Zone 4 from 151 (80 % = 150.4).
+  // The small epsilon keeps exact products (200 * 0.6 = 120) from moving up.
+  const at = (p: number) => Math.ceil(maxHr * p - 1e-9);
   return [
     { name: 'Restorative', min: 0, max: at(0.5) - 1 },
     { name: 'Zone 1', min: at(0.5), max: at(0.6) - 1 },
@@ -273,6 +275,32 @@ export function karvonenZones(maxHr: number, restingHr: number): HrZone[] {
     { name: 'Cardio', min: at(0.6), max: at(0.85) - 1 },
     { name: 'Peak', min: at(0.85), max: maxHr },
   ];
+}
+
+/**
+ * Zones from lower bounds that the user passes, e.g. the zones of their app.
+ * Each zone ends 1 bpm below the next one; the last ends at `maxHr` (or at
+ * its own lower bound if that is higher). Bounds must go up. Samples below
+ * the first bound go to an extra first zone, so they do not count in zone 1.
+ */
+export function customZones(zones: Array<{ name?: string; min: number }>, maxHr: number): HrZone[] {
+  for (let i = 1; i < zones.length; i++) {
+    if ((zones[i] as { min: number }).min <= (zones[i - 1] as { min: number }).min) {
+      throw new RangeError('custom_zones: each min must be higher than the one before.');
+    }
+  }
+  const out = zones.map((z, i) => {
+    const next = zones[i + 1];
+    return {
+      name: z.name ?? `Zone ${i + 1}`,
+      min: z.min,
+      max: next ? next.min - 1 : Math.max(maxHr, z.min),
+    };
+  });
+  const first = out[0];
+  if (first && first.min > 0)
+    out.unshift({ name: `Below ${first.name}`, min: 0, max: first.min - 1 });
+  return out;
 }
 
 /**

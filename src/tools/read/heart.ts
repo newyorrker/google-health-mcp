@@ -154,7 +154,10 @@ export function registerHeartReadTools(
         'timeInZones = minutes in the Fitbit zones (Out of Range, Fat Burn, Cardio, Peak), with the same computed bounds as heartRateZones in the other tools unless max_hr is passed: Karvonen from max heart rate (220 - age, or max_hr) and resting heart rate. ' +
         'zones.google = zone durations that Google stores for the workout (whole minutes); zones.bevel = zones by percent of max heart rate (Bevel default). ' +
         'Zones in timeInZones and zones.bevel have min and max in bpm (Google gives no bounds for zones.google); the top zone (Peak, Zone 5) ends at max heart rate, and a sample above it still counts in the top zone. ' +
-        'padding_minutes adds context before and after the workout to the series only; the summary and zones cover the workout itself.',
+        'padding_minutes adds context before and after the workout to the series only; the summary and zones cover the workout itself. ' +
+        'custom_zones = your own lower zone bounds (for example from your app); gives zones.custom. ' +
+        'plan = the workout plan, for example "5w 3r [3r 3w]x4 8w 5w" (minutes + label, [..]xN repeats, 1:30r = 90 s); gives plan.segments with peak, avg, min and the end value for each segment, and plan.recovery with HRR60 (heart-rate drop 60 s after the last work segment). ' +
+        'Segments follow each other from the workout start in active time (pauses are skipped). With plan, set include_points to false to get a short answer.',
       inputSchema: {
         exerciseId: z.string().optional().describe('exerciseId from get_exercise_list.'),
         logId: z.number().int().optional().describe('Numeric logId from get_exercise_list.'),
@@ -171,10 +174,51 @@ export function registerHeartReadTools(
           .max(240)
           .optional()
           .describe('Maximum heart rate for computed zones. Default 220 - age.'),
+        custom_zones: z
+          .array(
+            z.object({
+              name: z.string().max(40).optional(),
+              min: z.number().int().min(30).max(240).describe('Lowest bpm of the zone.'),
+            }),
+          )
+          .min(1)
+          .max(10)
+          .optional()
+          .describe(
+            'Your zones, lowest first, e.g. [{"name":"Z1","min":94},...,{"name":"Z5","min":170}]. Each zone ends 1 bpm below the next one; the last ends at max heart rate.',
+          ),
+        plan: z
+          .string()
+          .max(500)
+          .optional()
+          .describe(
+            'Workout plan, e.g. "5w 3r [3r 3w]x4 8w 5w". Number = minutes, letters = label.',
+          ),
+        work_label: z
+          .string()
+          .max(20)
+          .default('r')
+          .describe('Plan label of work segments. HRR60 follows the last one.'),
+        include_points: z
+          .boolean()
+          .default(true)
+          .describe('False leaves points empty. Use false with plan on long workouts.'),
         fields: FieldsSchema,
       },
     },
-    async ({ exerciseId, logId, date, resolution, padding_minutes, max_hr, fields }) => {
+    async ({
+      exerciseId,
+      logId,
+      date,
+      resolution,
+      padding_minutes,
+      max_hr,
+      custom_zones,
+      plan,
+      work_label,
+      include_points,
+      fields,
+    }) => {
       try {
         const getExerciseHr = provider.getExerciseHeartRate?.bind(provider);
         if (!getExerciseHr) throw unsupported('get_exercise_heart_rate');
@@ -183,11 +227,20 @@ export function registerHeartReadTools(
           resolution: resolution ?? '5s',
           paddingMinutes: padding_minutes ?? 0,
           maxHr: max_hr,
+          customZones: custom_zones,
+          plan: plan?.trim() || undefined,
+          workLabel: work_label ?? 'r',
+          includePoints: include_points ?? true,
         };
         const ref = { exerciseId, logId, date };
         const data = await getCached(
           env,
-          cacheKey('get_exercise_heart_rate.v3', { ...ref, ...opts }),
+          // String(array of objects) gives "[object Object]", so zones go in as JSON.
+          cacheKey('get_exercise_heart_rate.v4', {
+            ...ref,
+            ...opts,
+            customZones: custom_zones && JSON.stringify(custom_zones),
+          }),
           () => getExerciseHr(ref, opts),
           { ttlSec: date ? cacheTtlForDate(date) : 300 },
         );

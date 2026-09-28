@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   bucketize,
+  customZones,
   type HrSample,
   isoLocal,
   isoUtc,
@@ -111,8 +112,17 @@ describe('sliceByTime', () => {
 describe('zones', () => {
   it('builds Bevel percent-of-max zones', () => {
     const z = percentMaxZones(187);
-    expect(z.map((x) => x.min)).toEqual([0, 94, 112, 131, 150, 168]);
+    expect(z.map((x) => x.min)).toEqual([0, 94, 113, 131, 150, 169]);
     expect(z[5]?.max).toBe(187);
+    // Bevel rounds up: max 188 gives Zone 4 from 151 and Zone 5 from 170.
+    expect(
+      percentMaxZones(188)
+        .slice(4)
+        .map((x) => [x.min, x.max]),
+    ).toEqual([
+      [151, 169],
+      [170, 188],
+    ]);
   });
 
   it('builds Fitbit Karvonen zones that end at max heart rate', () => {
@@ -124,6 +134,16 @@ describe('zones', () => {
       ['Cardio', 136, 167],
       ['Peak', 168, 187],
     ]);
+  });
+
+  it('builds custom zones from lower bounds', () => {
+    expect(customZones([{ name: 'Z1', min: 94 }, { min: 151 }, { min: 170 }], 188)).toEqual([
+      { name: 'Below Z1', min: 0, max: 93 },
+      { name: 'Z1', min: 94, max: 150 },
+      { name: 'Zone 2', min: 151, max: 169 },
+      { name: 'Zone 3', min: 170, max: 188 },
+    ]);
+    expect(() => customZones([{ min: 150 }, { min: 150 }], 188)).toThrow(/higher/);
   });
 
   it('weights time by the gap to the next sample and caps long gaps', () => {
